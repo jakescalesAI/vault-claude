@@ -12,13 +12,13 @@ const DEFAULT_SETTINGS = {
   hostBind: "local", // "local" | "tailscale" | "all"
   claudePath: "",
   transcribeCommand: "",
-  model: "opus",
+  model: "sonnet",
   effort: "medium",
   permissionMode: "acceptEdits",
   sendContext: true,
   sessions: [], // [{id, title, updated, pinned?, items: [...]}] newest first
 };
-const MODELS = [["opus", "Opus"], ["sonnet", "Sonnet"], ["haiku", "Haiku"]];
+const MODELS = [["sonnet", "Sonnet"], ["opus", "Opus"], ["haiku", "Haiku"]];
 const EFFORTS = [["low", "Low"], ["medium", "Med"], ["high", "High"], ["max", "Max"]];
 const MODES = [["acceptEdits", "Edit"], ["plan", "Plan"], ["default", "Read"]];
 const FILE_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"]);
@@ -205,7 +205,7 @@ class VaultClaudeView extends ItemView {
   // Tint the brain when anything differs from the defaults, so the state is visible at a glance.
   updateBrain() {
     const s = this.plugin.settings;
-    this.brainBtn.toggleClass("is-custom", s.permissionMode !== "acceptEdits" || s.model !== "opus" || s.effort !== "medium");
+    this.brainBtn.toggleClass("is-custom", s.permissionMode !== "acceptEdits" || s.model !== DEFAULT_SETTINGS.model || s.effort !== DEFAULT_SETTINGS.effort);
   }
 
   closeMenu() {
@@ -634,6 +634,7 @@ class VaultClaudeView extends ItemView {
       return;
     }
     if (msg.type === "transcript") { this.onTranscript(msg); return; }
+    if (msg.type === "notice") { this.session.id = null; this.toast(msg.message.split(".")[0]); return; }
     if (msg.type === "error" && msg.code === "auth") { this.unpaired = true; this.setStatus("unpaired"); return; }
     if (msg.type === "error") { this.addItem({ kind: "error", text: msg.message }); return; }
     if (msg.type === "done") { this.finishTurn(msg.sessionId); return; }
@@ -794,36 +795,115 @@ class VaultClaudeView extends ItemView {
   }
 
   // ---------- dictation ----------
-  // Tap to record, tap again to stop. The host computer transcribes the audio (faster-whisper) and
-  // the text lands in the message box to check before sending.
+  // Tap to talk, tap again to stop; the text lands in the message box to check before sending.
+  // Where the device has its own speech recognition (iPad, iPhone), words appear live as you
+  // speak, the way Quartzi does it. Otherwise (desktop) the clip is recorded and the host
+  // computer transcribes it with faster-whisper, which it warms up as soon as the mic opens.
   async toggleRecording() {
+    if (this.speech) return this.stopSpeech();
     if (this.recorder) { this.recorder.stop(); return; }
     if (this.transcribing) return;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SR && !Platform.isDesktopApp && !this.speechBroken) return this.startSpeech(SR);
+    return this.startRecorder();
+  }
+
+  startSpeech(SR) {
+    let rec;
+    try { rec = new SR(); } catch (e) { this.speechBroken = true; return this.startRecorder(); }
+    const input = this.inputEl;
+    const session = { rec, base: input.value, heard: false };
+    this.speech = session;
+    rec.lang = navigator.language || "en-US";
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.maxAlternatives = 1;
+    const end = () => {
+      if (this.speech !== session) return;
+      clearTimeout(session.stopTimer);
+      this.speech = null;
+      rec.onresult = rec.onerror = rec.onend = null;
+      this.setMicState("idle");
+    };
+    rec.onresult = (event) => {
+      if (this.speech !== session) return;
+      // Results are cumulative: rebuild the whole utterance each time so revised words
+      // never repeat.
+      const parts = [];
+      for (let i = 0; i < event.results.length; i++) {
+        const t = event.results[i] && event.results[i][0] && event.results[i][0].transcript;
+        if (t) parts.push(t.trim());
+      }
+      const spoken = parts.filter(Boolean).join(" ");
+      const sep = session.base && spoken && !/\s$/.test(session.base) ? " " : "";
+      input.value = session.base + sep + spoken;
+      session.heard = session.heard || !!spoken;
+      this.autosize();
+      this.updateSendButton();
+    };
+    rec.onerror = (event) => {
+      const code = event && event.error;
+      end();
+      // No speech service in this app: fall back to recording for the host to transcribe.
+      if (code === "service-not-allowed" || code === "network" || code === "language-not-supported") {
+        this.speechBroken = true;
+        return this.startRecorder();
+      }
+      if (code === "not-allowed") return this.alert("Microphone Access", "Allow microphone and speech recognition for Obsidian in Settings, then try again.", [{ label: "OK", primary: true }]);
+      if (code === "audio-capture") return this.alert("No Microphone", "No microphone is available.", [{ label: "OK", primary: true }]);
+      if (code !== "no-speech" && code !== "aborted") this.toast("Dictation stopped");
+    };
+    rec.onend = () => { end(); if (session.heard) input.focus(); };
+    try { rec.start(); } catch (e) { end(); this.speechBroken = true; return this.startRecorder(); }
+    this.setMicState("recording");
+  }
+
+  stopSpeech() {
+    const session = this.speech;
+    if (!session) return;
+    // stop() asks for the final words; don't leave the mic stuck if the end event never comes.
+    session.stopTimer = window.setTimeout(() => {
+      if (this.speech === session) { try { session.rec.abort(); } catch (e) { /* stopped */ } if (session.rec.onend) session.rec.onend(); }
+    }, 2500);
+    try { session.rec.stop(); } catch (e) { if (session.rec.onend) session.rec.onend(); }
+  }
+
+  async startRecorder() {
     if (!this.isReady()) {
       this.alert("Not Connected", "Dictation is transcribed on your computer, so it needs a connection.", [{ label: "OK", primary: true }]);
       return;
     }
-    if (!navigator.mediaDevices || !window.MediaRecorder) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
       this.alert("Microphone Unavailable", "This device doesn't allow recording here. Use the keyboard's dictation key instead.", [{ label: "OK", primary: true }]);
       return;
     }
+    this.ws.send(JSON.stringify({ type: "warmup" })); // load the speech model while you talk
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
     } catch (e) {
-      this.alert("Microphone Access", "Allow microphone access for Obsidian, then try again.", [{ label: "OK", primary: true }]);
+      const name = e && e.name;
+      const msg = name === "NotFoundError" ? "No microphone was found. Connect one and try again."
+        : name === "NotReadableError" ? "Another app is using the microphone. Close it and try again."
+        : Platform.isWin ? "Windows blocked the microphone. Open Settings → Privacy & security → Microphone, turn on \"Let desktop apps access your microphone\", then try again."
+        : Platform.isMacOS ? "Allow Obsidian in System Settings → Privacy & Security → Microphone, then try again."
+        : "Allow microphone access for Obsidian, then try again.";
+      this.alert("Microphone Access", msg, [{ label: "OK", primary: true }]);
       return;
     }
     const mime = ["audio/webm;codecs=opus", "audio/mp4", "audio/webm", "audio/ogg"].find((m) => MediaRecorder.isTypeSupported(m)) || "";
-    const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    let rec;
+    try { rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined); }
+    catch (e) { rec = new MediaRecorder(stream); }
     const chunks = [];
+    const started = Date.now();
     rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
     rec.onstop = async () => {
       stream.getTracks().forEach((t) => t.stop());
       clearTimeout(this.recordLimit);
       this.recorder = null;
       const blob = new Blob(chunks, { type: rec.mimeType || mime || "audio/webm" });
-      if (blob.size < 1000) { this.setMicState("idle"); return; }
+      if (!blob.size || Date.now() - started < 400) { this.setMicState("idle"); return; }
       this.setMicState("transcribing");
       const data = await readBase64(blob);
       if (!this.isReady()) {
@@ -832,8 +912,13 @@ class VaultClaudeView extends ItemView {
         return;
       }
       this.ws.send(JSON.stringify({ type: "transcribe", mime: blob.type, data }));
+      // Never leave the mic stuck on "Transcribing" if the answer doesn't come.
+      clearTimeout(this.transcribeTimer);
+      this.transcribeTimer = window.setTimeout(() => {
+        if (this.transcribing) { this.setMicState("idle"); this.toast("Dictation timed out"); }
+      }, 90000);
     };
-    rec.start();
+    rec.start(250);
     this.recorder = rec;
     this.recordLimit = window.setTimeout(() => this.recorder && this.recorder.stop(), 5 * 60 * 1000);
     this.setMicState("recording");
@@ -848,6 +933,7 @@ class VaultClaudeView extends ItemView {
   }
 
   onTranscript(msg) {
+    clearTimeout(this.transcribeTimer);
     this.setMicState("idle");
     if (msg.error) {
       this.alert("Dictation Unavailable", msg.error, [{ label: "OK", primary: true }]);
@@ -1052,15 +1138,23 @@ possibly on their iPad or phone. The vault is your working directory. Cite notes
 those links are clickable in the sidebar. Edit notes with your Edit/Write tools. Keep replies
 readable on a narrow sidebar.`;
 
-const TRANSCRIBE_PY = `import sys
+const TRANSCRIBE_PY = `import json, sys
 try:
     from faster_whisper import WhisperModel
 except ImportError:
     print("faster-whisper is not installed", file=sys.stderr)
     sys.exit(3)
-model = WhisperModel(sys.argv[2] if len(sys.argv) > 2 else "small", device="cpu", compute_type="int8")
-segments, _ = model.transcribe(sys.argv[1], vad_filter=True)
-print(" ".join(s.text.strip() for s in segments).strip())
+model = WhisperModel(sys.argv[1] if len(sys.argv) > 1 else "small", device="cpu", compute_type="int8")
+print(json.dumps({"ready": True}), flush=True)
+for line in sys.stdin:
+    path = line.strip()
+    if not path:
+        continue
+    try:
+        segments, _ = model.transcribe(path, vad_filter=True)
+        print(json.dumps({"text": " ".join(s.text.strip() for s in segments).strip()}), flush=True)
+    except Exception as e:
+        print(json.dumps({"error": str(e)}), flush=True)
 `;
 
 const PERMISSION_MODES = new Set(["acceptEdits", "plan", "default"]);
@@ -1256,6 +1350,7 @@ class Host {
   }
 
   stop() {
+    if (this.worker) { try { this.worker.proc.kill(); } catch (e) { /* gone */ } this.worker = null; }
     for (const s of this.servers) { try { s.close(); } catch (e) { /* closed */ } }
     for (const c of this.conns || []) c.close();
     this.servers = [];
@@ -1301,10 +1396,12 @@ class Host {
         return;
       }
       if (msg.type === "send") {
-        if (proc && proc.exitCode === null) { ws.send({ type: "error", message: "Claude is still working on the last message." }); return; }
+        if (proc && proc.proc.exitCode === null) { ws.send({ type: "error", message: "Claude is still working on the last message." }); return; }
         proc = this.runTurn(ws, msg);
       } else if (msg.type === "interrupt") {
-        if (proc && proc.exitCode === null) proc.kill();
+        if (proc && proc.proc.exitCode === null) proc.proc.kill();
+      } else if (msg.type === "warmup") {
+        if (!this.config.transcribeCommand) this.whisper();
       } else if (msg.type === "transcribe") {
         this.transcribe(ws, msg);
       } else if (msg.type === "ping") {
@@ -1349,7 +1446,7 @@ class Host {
     return saved;
   }
 
-  runTurn(ws, msg) {
+  runTurn(ws, msg, fresh) {
     const cp = nodeRequire("child_process");
     const args = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
       "--append-system-prompt", SYSTEM_PROMPT];
@@ -1357,14 +1454,16 @@ class Host {
     args.push("--permission-mode", mode);
     if (msg.model && /^[\w.-]+$/.test(msg.model)) args.push("--model", msg.model);
     if (EFFORT_LEVELS.has(msg.effort)) args.push("--effort", msg.effort);
-    if (msg.sessionId && /^[\w-]+$/.test(msg.sessionId)) args.push("--resume", msg.sessionId);
-    const saved = this.saveAttachments(msg.attachments);
+    const resume = !fresh && msg.sessionId && /^[\w-]+$/.test(msg.sessionId) ? msg.sessionId : null;
+    if (resume) args.push("--resume", resume);
+    const saved = fresh ? fresh.saved : this.saveAttachments(msg.attachments);
     if (saved.length) args.push("--add-dir", nodeRequire("path").dirname(saved[0].path));
 
     const proc = cp.spawn(this.claude, args, { cwd: this.config.vaultPath, env: process.env, windowsHide: true });
-    let sessionId = msg.sessionId || null;
+    let sessionId = resume;
     let pending = "";
     let stderr = "";
+    let events = 0;
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (chunk) => {
       pending += chunk;
@@ -1376,32 +1475,77 @@ class Host {
         let event;
         try { event = JSON.parse(line); } catch (e) { continue; }
         if (event.session_id) sessionId = event.session_id;
+        events++;
         ws.send({ type: "event", event });
       }
     });
     proc.stderr.setEncoding("utf8");
     proc.stderr.on("data", (d) => { stderr = (stderr + d).slice(-4000); });
+    const turn = { proc };
     proc.on("error", (e) => {
       ws.send({ type: "error", message: "Couldn't start Claude Code: " + e.message });
       ws.send({ type: "done", sessionId, code: -1 });
     });
     proc.on("close", (code) => {
-      if (code && stderr.trim()) ws.send({ type: "error", message: stderr.trim().slice(-2000) });
+      // A chat from another computer or an older setup can't be resumed here: start it fresh
+      // with the same message instead of failing.
+      if (code && resume && /No conversation found/i.test(stderr)) {
+        ws.send({ type: "notice", message: "Started a new conversation. The earlier one isn't on this computer." });
+        turn.proc = this.runTurn(ws, msg, { saved }).proc;
+        return;
+      }
+      const err = stderr
+        .replace(/\S+ hook \[[\s\S]*?\] failed: Hook cancelled\s*/g, "")
+        .trim();
+      if (code && err && !(code === 143 || code === null)) ws.send({ type: "error", message: err.slice(-2000) });
       ws.send({ type: "done", sessionId, code });
     });
     proc.stdin.end(this.buildPrompt(msg, saved));
-    return proc;
+    return turn;
   }
 
-  transcribeCommand() {
-    if (this.config.transcribeCommand) return { shell: this.config.transcribeCommand };
+  // One Python process keeps the speech model loaded, so each recording takes about a second
+  // instead of reloading the model every time. The sidebar sends "warmup" when the mic opens.
+  whisper() {
+    if (this.worker && !this.worker.dead) return this.worker;
     const fs = nodeRequire("fs");
     const path = nodeRequire("path");
+    const cp = nodeRequire("child_process");
     if (this.python === undefined) this.python = findPython();
     if (!this.python) return null;
     const script = path.join(this.tmp, "transcribe.py");
     fs.writeFileSync(script, TRANSCRIBE_PY);
-    return { file: this.python[0], args: [...this.python[1], script] };
+    const proc = cp.spawn(this.python[0], [...this.python[1], script, "small"], {
+      windowsHide: true, env: Object.assign({}, process.env, { PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" }),
+    });
+    const w = { proc, queue: [], buf: "", err: "", dead: false };
+    const fail = (message) => { w.dead = true; w.queue.splice(0).forEach((cb) => cb({ error: message })); };
+    proc.stdout.setEncoding("utf8");
+    proc.stdout.on("data", (d) => {
+      w.buf += d;
+      let nl;
+      while ((nl = w.buf.indexOf("\n")) >= 0) {
+        const line = w.buf.slice(0, nl).trim();
+        w.buf = w.buf.slice(nl + 1);
+        let obj;
+        try { obj = JSON.parse(line); } catch (e) { continue; }
+        if (obj.ready) continue;
+        const cb = w.queue.shift();
+        if (cb) cb(obj);
+      }
+    });
+    proc.stderr.setEncoding("utf8");
+    proc.stderr.on("data", (d) => { w.err = (w.err + d).slice(-2000); });
+    proc.on("error", (e) => fail("Couldn't run speech-to-text: " + e.message));
+    proc.on("close", (code) => {
+      if (code === 3) {
+        const py = [this.python[0], ...this.python[1]].join(" ");
+        return fail(`Speech-to-text isn't installed on the host computer yet. Run this there:\n${py} -m pip install faster-whisper`);
+      }
+      fail("Speech-to-text stopped. " + (w.err.trim().split("\n").pop() || ""));
+    });
+    this.worker = w;
+    return w;
   }
 
   transcribe(ws, msg) {
@@ -1409,28 +1553,30 @@ class Host {
     const path = nodeRequire("path");
     const cp = nodeRequire("child_process");
     const crypto = nodeRequire("crypto");
-    const ext = { "audio/mp4": ".m4a", "audio/ogg": ".ogg" }[String(msg.mime || "").split(";")[0]] || ".webm";
+    const ext = { "audio/mp4": ".m4a", "audio/ogg": ".ogg", "audio/wav": ".wav" }[String(msg.mime || "").split(";")[0]] || ".webm";
     const file = path.join(this.tmp, "dictation-" + crypto.randomBytes(4).toString("hex") + ext);
     fs.writeFileSync(file, Buffer.from(String(msg.data || ""), "base64"));
-    const cmd = this.transcribeCommand();
-    const done = (payload) => { try { fs.unlinkSync(file); } catch (e) { /* gone */ } ws.send({ type: "transcript", ...payload }); };
-    if (!cmd) return done({ error: "Dictation needs Python 3 with faster-whisper on the host computer." });
-    const child = cmd.shell
-      ? cp.spawn(cmd.shell.includes("{file}") ? cmd.shell.split("{file}").join(`"${file}"`) : `${cmd.shell} "${file}"`, { shell: true, windowsHide: true })
-      : cp.spawn(cmd.file, [...cmd.args, file], { windowsHide: true });
-    let out = "";
-    let err = "";
-    child.stdout.on("data", (d) => { out += d; });
-    child.stderr.on("data", (d) => { err = (err + d).slice(-2000); });
-    child.on("error", (e) => done({ error: "Couldn't run speech-to-text: " + e.message }));
-    child.on("close", (code) => {
-      if (code === 0) return done({ text: out.trim() });
-      if (code === 3) {
-        const py = this.python ? [this.python[0], ...this.python[1]].join(" ") : "python3";
-        return done({ error: `Speech-to-text isn't installed on the host computer yet. Run this there:\n${py} -m pip install faster-whisper` });
-      }
-      done({ error: "Couldn't transcribe that recording. " + err.trim().split("\n").pop() });
-    });
+    const done = (payload) => {
+      try { fs.unlinkSync(file); } catch (e) { /* gone */ }
+      if (payload.error) payload.error = String(payload.error).startsWith("Speech") || String(payload.error).startsWith("Couldn")
+        ? payload.error : "Couldn't transcribe that recording. " + payload.error;
+      ws.send({ type: "transcript", text: payload.text, error: payload.error });
+    };
+    if (this.config.transcribeCommand) {
+      const cmd = this.config.transcribeCommand;
+      const child = cp.spawn(cmd.includes("{file}") ? cmd.split("{file}").join(`"${file}"`) : `${cmd} "${file}"`, { shell: true, windowsHide: true });
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (d) => { out += d; });
+      child.stderr.on("data", (d) => { err = (err + d).slice(-2000); });
+      child.on("error", (e) => done({ error: "Couldn't run speech-to-text: " + e.message }));
+      child.on("close", (code) => done(code === 0 ? { text: out.trim() } : { error: err.trim().split("\n").pop() || "exit " + code }));
+      return;
+    }
+    const w = this.whisper();
+    if (!w) return done({ error: "Speech-to-text needs Python 3 with faster-whisper on the host computer." });
+    w.queue.push(done);
+    w.proc.stdin.write(file + "\n");
   }
 }
 
