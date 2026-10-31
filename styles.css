@@ -506,6 +506,42 @@ body.theme-dark .vc-root {
 .vc-menu-check { width: 20px; flex: none; display: flex; justify-content: center; color: var(--vc-blue); }
 .vc-menu-row .vc-caption { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
+/* ---------- message menu (right-click / long-press) ---------- */
+.vc-menu-msg { width: 220px; padding: 0 0 4px; }
+.vc-menu-time { padding: 10px 16px 8px; border-bottom: 0.5px solid var(--vc-sep); }
+.vc-menu-msg .vc-menu-row { justify-content: space-between; padding: 8px 16px !important; }
+.vc-menu-msg .vc-menu-row + .vc-menu-row::before { left: 0; }
+.vc-menu-label { flex: 1; }
+.vc-menu-ico { color: var(--vc-text-2); }
+
+/* ---------- replies ---------- */
+.vc-reply-bar { display: none; }
+.vc-reply-bar.is-on {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 2px 6px;
+  padding: 6px 4px 6px 12px;
+  border-radius: 12px;
+  background: var(--vc-fill);
+  animation: vc-rise 0.25s var(--vc-ease);
+}
+.vc-reply-ico { color: var(--vc-blue); flex: none; }
+.vc-reply-body { flex: 1; min-width: 0; border-left: 2px solid var(--vc-blue); padding-left: 8px; }
+.vc-reply-who { font-size: 12px; font-weight: 600; color: var(--vc-blue); }
+.vc-reply-text { font-size: 13px; color: var(--vc-text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vc-reply-x { flex: none; min-width: 32px !important; color: var(--vc-text-2) !important; }
+.vc-reply-quote {
+  max-width: 85%;
+  margin-bottom: 3px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--vc-blue);
+  border-radius: 8px;
+  background: var(--vc-fill);
+}
+.vc-reply-quote .vc-reply-text { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+
 /* ---------- pinned chats ---------- */
 .vc-row-2 { cursor: pointer; }
 .vc-row-2:active { opacity: 0.35; }

@@ -41,6 +41,8 @@ const ICONS = {
   mic: '<rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/>',
   sparkle: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>',
   pin: '<path d="M12 17v4"/><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3z"/>',
+  reply: '<path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 6 6v5"/>',
+  copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
   pinFill: '<path d="M12 17v4"/><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3z" fill="currentColor"/>',
 };
 function icon(parent, name, cls) {
@@ -98,6 +100,7 @@ class VaultClaudeView extends ItemView {
     const composer = root.createDiv("vc-composer");
     composer.createDiv("vc-glass vc-glass-bottom");
     this.composerEl = composer;
+    this.replyEl = composer.createDiv("vc-reply-bar");
     this.trayEl = composer.createDiv("vc-tray");
     const field = composer.createDiv("vc-field");
     this.inputEl = field.createEl("textarea", { cls: "vc-input", attr: { placeholder: "Message", rows: "1" } });
@@ -142,6 +145,26 @@ class VaultClaudeView extends ItemView {
     this.registerEvent(this.app.workspace.on("file-open", () => this.updateContext()));
     this.registerEvent(this.app.workspace.on("layout-change", () => this.updateContext()));
     this.registerDomEvent(document, "click", () => this.closeMenu());
+    this.registerDomEvent(this.messagesEl, "contextmenu", (e) => {
+      const el = this.messageAt(e.target);
+      if (!el) return;
+      e.preventDefault();
+      this.openMessageMenu(el, e.clientX, e.clientY);
+    });
+    // Touch: hold a message for half a second.
+    let press = null;
+    const clearPress = () => { if (press) clearTimeout(press.timer); press = null; };
+    this.registerDomEvent(this.messagesEl, "touchstart", (e) => {
+      const el = this.messageAt(e.target);
+      if (!el || e.touches.length !== 1) return;
+      const t = e.touches[0];
+      press = { x: t.clientX, y: t.clientY, timer: window.setTimeout(() => { press = null; this.openMessageMenu(el, t.clientX, t.clientY); }, 500) };
+    }, { passive: true });
+    this.registerDomEvent(this.messagesEl, "touchmove", (e) => {
+      if (press && e.touches[0] && Math.hypot(e.touches[0].clientX - press.x, e.touches[0].clientY - press.y) > 10) clearPress();
+    }, { passive: true });
+    this.registerDomEvent(this.messagesEl, "touchend", clearPress);
+    this.registerDomEvent(this.messagesEl, "touchcancel", clearPress);
     this.updateContext();
     this.updateBrain();
     this.setRunning(false);
@@ -531,22 +554,24 @@ class VaultClaudeView extends ItemView {
       return;
     }
     const ctx = this.plugin.settings.sendContext ? this.currentContext() : {};
+    const reply = this.replyTo || null;
+    this.setReply(null);
     this.inputEl.value = "";
     this.autosize();
     this.pending = [];
     this.renderTray();
-    if (this.running) this.enqueue(text, ctx, attachments);
-    else this.dispatch([{ text, ctx, attachments }]);
+    if (this.running) this.enqueue(text, ctx, attachments, reply);
+    else this.dispatch([{ text, ctx, attachments, reply }]);
     this.updateSendButton();
   }
 
-  enqueue(text, ctx, attachments) {
+  enqueue(text, ctx, attachments, reply) {
     if (!this.queueEl) this.queueEl = this.messagesEl.createDiv("vc-queue");
     const wrap = this.queueEl.createDiv("vc-user-wrap is-queued");
     this.renderAttachments(wrap, attachments);
     if (text) wrap.createDiv({ cls: "vc-bubble", text });
     wrap.createDiv({ cls: "vc-caption", text: "Queued · tap to cancel" });
-    const entry = { text, ctx, attachments, el: wrap };
+    const entry = { text, ctx, attachments, reply, el: wrap };
     wrap.onclick = () => {
       this.queue = this.queue.filter((q) => q !== entry);
       wrap.remove();
@@ -573,10 +598,11 @@ class VaultClaudeView extends ItemView {
       if (!this.session.customTitle) this.session.title = (entries[0].text || (entries[0].attachments || []).map((a) => a.name).join(", ")).slice(0, 60);
       this.titleEl.setText(this.session.title);
     }
-    for (const { text, ctx, attachments } of entries) {
+    for (const { text, ctx, attachments, reply } of entries) {
       // History keeps names and small previews only; the full files go to the host once.
       const files = (attachments || []).map((a) => ({ name: a.name, mime: a.mime, thumb: a.thumb || null }));
-      const item = { kind: "user", text, file: ctx.activeFile || null, files };
+      const item = { kind: "user", text, file: ctx.activeFile || null, files, at: Date.now() };
+      if (reply) item.reply = reply;
       this.session.items.push(item);
       const el = this.renderItem(item);
       if (!fromQueue) this.flyIn(el);
@@ -584,7 +610,7 @@ class VaultClaudeView extends ItemView {
     const s = this.plugin.settings;
     this.ws.send(JSON.stringify({
       type: "send",
-      text: entries.map((e) => e.text).filter(Boolean).join("\n\n") || "(See the attached files.)",
+      text: entries.map((e) => (e.reply ? quoteFor(e.reply) : "") + (e.text || "")).filter(Boolean).join("\n\n") || "(See the attached files.)",
       sessionId: this.session.id,
       model: s.model, effort: s.effort, permissionMode: s.permissionMode,
       context: entries[entries.length - 1].ctx,
@@ -714,11 +740,13 @@ class VaultClaudeView extends ItemView {
 
   // The full text block arrives after its deltas: let the typer finish with exactly that text.
   commitText(text) {
-    this.session.items.push({ kind: "assistant", text });
+    const item = { kind: "assistant", text, at: Date.now() };
+    this.session.items.push(item);
     let t = this.live;
     if (!t) {
       t = { el: this.messagesEl.createDiv("vc-msg vc-assistant is-new"), target: "", shown: 0, rendered: -1, lastRender: 0 };
     }
+    t.el.vcItem = item;
     t.target = text;
     t.shown = Math.min(t.shown, text.length);
     t.committed = true;
@@ -734,7 +762,9 @@ class VaultClaudeView extends ItemView {
     if (!t) return;
     this.live = null;
     if (!t.target) return;
-    this.session.items.push({ kind: "assistant", text: t.target });
+    const item = { kind: "assistant", text: t.target, at: Date.now() };
+    this.session.items.push(item);
+    t.el.vcItem = item;
     t.committed = true;
     this.typers.add(t);
     this.startTyping();
@@ -1011,6 +1041,56 @@ class VaultClaudeView extends ItemView {
     }
   }
 
+  // ---------- message menu ----------
+  messageAt(target) {
+    let el = target && target.closest ? target.closest(".vc-bubble, .vc-assistant, .vc-user-wrap") : null;
+    while (el && !el.vcItem && el !== this.messagesEl) el = el.parentElement && el.parentElement.closest(".vc-bubble, .vc-assistant, .vc-user-wrap");
+    return el && el.vcItem ? el : null;
+  }
+
+  // Like Quartzi: when it was sent, then Reply and Copy (Copy selection if text is selected).
+  openMessageMenu(el, x, y) {
+    this.closeMenu();
+    const item = el.vcItem;
+    const sel = window.getSelection();
+    const selected = sel && !sel.isCollapsed && el.contains(sel.anchorNode) ? sel.toString().trim() : "";
+    const menu = this.root.createDiv("vc-menu vc-menu-msg vc-material");
+    menu.onclick = (e) => e.stopPropagation();
+    menu.createDiv({ cls: "vc-menu-time vc-caption vc-num", text: (item.kind === "user" ? "You · " : "Claude · ") + (item.at ? whenText(item.at) : "Earlier") });
+    const row = (name, label, run) => {
+      const b = menu.createEl("button", { cls: "vc-menu-row" });
+      b.createSpan({ cls: "vc-menu-label", text: label });
+      icon(b, name, "vc-ico-sm vc-menu-ico");
+      b.onclick = () => { this.closeMenu(); run(); };
+    };
+    row("reply", "Reply", () => this.setReply({ who: item.kind === "user" ? "you" : "claude", text: excerpt(selected || item.text || (item.files || []).map((f) => f.name).join(", ")) }));
+    const copyText = selected || item.text || "";
+    if (copyText) row("copy", selected ? "Copy Selection" : "Copy", async () => {
+      try { await navigator.clipboard.writeText(copyText); this.toast("Copied"); }
+      catch (e) { this.toast("Couldn't copy"); }
+    });
+    const box = this.root.getBoundingClientRect();
+    menu.style.transformOrigin = "top left";
+    const w = 220;
+    menu.style.left = `${Math.max(8, Math.min(x - box.left, box.width - w - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(y - box.top, box.height - 150))}px`;
+    this.menuEl = menu;
+  }
+
+  setReply(reply) {
+    this.replyTo = reply;
+    this.replyEl.empty();
+    this.replyEl.toggleClass("is-on", !!reply);
+    if (!reply) return;
+    icon(this.replyEl, "reply", "vc-ico-sm vc-reply-ico");
+    const body = this.replyEl.createDiv("vc-reply-body");
+    body.createDiv({ cls: "vc-reply-who", text: reply.who === "you" ? "Replying to yourself" : "Replying to Claude" });
+    body.createDiv({ cls: "vc-reply-text", text: reply.text });
+    const x = this.iconButton(this.replyEl, "xmark", "Cancel reply", () => this.setReply(null));
+    x.addClass("vc-reply-x");
+    this.inputEl.focus();
+  }
+
   // ---------- rendering ----------
   renderItem(item) {
     let ret = null;
@@ -1023,9 +1103,17 @@ class VaultClaudeView extends ItemView {
         f.createSpan({ text: item.file.split("/").pop().replace(/\.md$/, "") });
       }
       this.renderAttachments(wrap, item.files);
-      if (item.text) wrap.createDiv({ cls: "vc-bubble", text: item.text });
+      if (item.reply) {
+        const q = wrap.createDiv("vc-reply-quote");
+        q.createDiv({ cls: "vc-reply-who", text: item.reply.who === "you" ? "You" : "Claude" });
+        q.createDiv({ cls: "vc-reply-text", text: item.reply.text });
+      }
+      if (item.text) wrap.createDiv({ cls: "vc-bubble", text: item.text }).vcItem = item;
+      else if (item.files && item.files.length) wrap.vcItem = item;
     } else if (item.kind === "assistant") {
-      this.renderMarkdown(this.messagesEl.createDiv("vc-msg vc-assistant"), item.text);
+      const el = this.messagesEl.createDiv("vc-msg vc-assistant");
+      el.vcItem = item;
+      this.renderMarkdown(el, item.text);
     } else if (item.kind === "tool") {
       // Consecutive tool steps share one inset-grouped card.
       let card = this.messagesEl.lastElementChild;
@@ -1087,6 +1175,25 @@ class VaultClaudeView extends ItemView {
 
 const MAX_ATTACHMENT = 20 * 1048576;
 
+function excerpt(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  return t.length > 280 ? t.slice(0, 277) + "…" : t;
+}
+
+function quoteFor(reply) {
+  return (reply.who === "you" ? "Replying to my earlier message:" : "Replying to this part of your reply:") + "\n> " + reply.text + "\n\n";
+}
+
+function whenText(at) {
+  const d = new Date(at);
+  const now = new Date();
+  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (d.toDateString() === now.toDateString()) return `Today ${time}`;
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (d.toDateString() === y.toDateString()) return `Yesterday ${time}`;
+  return d.toLocaleDateString([], { month: "short", day: "numeric", year: d.getFullYear() === now.getFullYear() ? undefined : "numeric" }) + " " + time;
+}
+
 function readBase64(file) {
   return new Promise((resolve, reject) => {
     const r = new FileReader();
@@ -1144,14 +1251,14 @@ try:
 except ImportError:
     print("faster-whisper is not installed", file=sys.stderr)
     sys.exit(3)
-model = WhisperModel(sys.argv[1] if len(sys.argv) > 1 else "small", device="cpu", compute_type="int8")
+model = WhisperModel(sys.argv[1] if len(sys.argv) > 1 else "base.en", device="cpu", compute_type="int8")
 print(json.dumps({"ready": True}), flush=True)
 for line in sys.stdin:
     path = line.strip()
     if not path:
         continue
     try:
-        segments, _ = model.transcribe(path, vad_filter=True)
+        segments, _ = model.transcribe(path, vad_filter=True, beam_size=1, without_timestamps=True, condition_on_previous_text=False, language="en")
         print(json.dumps({"text": " ".join(s.text.strip() for s in segments).strip()}), flush=True)
     except Exception as e:
         print(json.dumps({"error": str(e)}), flush=True)
@@ -1346,10 +1453,17 @@ class Host {
       this.servers.push(server);
       this.addresses.push(h);
     }
+    this.chats = new Set();
+    if (!this.config.transcribeCommand) setTimeout(() => this.whisper(), 2000);
+    setTimeout(() => this.ensureSpare(this.signature({})), 1000);
     this.log(`Hosting on ${this.addresses.map((h) => h + ":" + this.config.port).join(", ")} with ${this.claude}`);
   }
 
   stop() {
+    this.stopped = true;
+    for (const c of this.chats || []) this.kill(c);
+    if (this.spare) this.kill(this.spare);
+    this.spare = null;
     if (this.worker) { try { this.worker.proc.kill(); } catch (e) { /* gone */ } this.worker = null; }
     for (const s of this.servers) { try { s.close(); } catch (e) { /* closed */ } }
     for (const c of this.conns || []) c.close();
@@ -1376,7 +1490,7 @@ class Host {
     this.conns.add(ws);
     const peer = socket.remoteAddress;
     let authed = false;
-    let proc = null;
+    ws.current = null; // the chat process running this device's turn
     // Unpaired connections get a few seconds to authenticate, then they are dropped.
     const authTimer = setTimeout(() => { if (!authed) ws.close(); }, 5000);
 
@@ -1396,10 +1510,10 @@ class Host {
         return;
       }
       if (msg.type === "send") {
-        if (proc && proc.proc.exitCode === null) { ws.send({ type: "error", message: "Claude is still working on the last message." }); return; }
-        proc = this.runTurn(ws, msg);
+        if (ws.current && ws.current.turn) { ws.send({ type: "error", message: "Claude is still working on the last message." }); return; }
+        this.runTurn(ws, msg);
       } else if (msg.type === "interrupt") {
-        if (proc && proc.proc.exitCode === null) proc.proc.kill();
+        if (ws.current && ws.current.turn) { ws.current.interrupted = true; this.kill(ws.current); }
       } else if (msg.type === "warmup") {
         if (!this.config.transcribeCommand) this.whisper();
       } else if (msg.type === "transcribe") {
@@ -1446,62 +1560,128 @@ class Host {
     return saved;
   }
 
-  runTurn(ws, msg, fresh) {
-    const cp = nodeRequire("child_process");
-    const args = ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-      "--append-system-prompt", SYSTEM_PROMPT];
+  // ---------- Claude processes ----------
+  // Starting Claude Code (hooks, MCP servers) takes 10-20 s. So each chat keeps one process
+  // running between messages (stream-json input), and one spare is kept warm for the next
+  // new chat. Changing mode, model or effort starts a new process that resumes the same chat.
+  signature(msg) {
     const mode = PERMISSION_MODES.has(msg.permissionMode) ? msg.permissionMode : "acceptEdits";
-    args.push("--permission-mode", mode);
-    if (msg.model && /^[\w.-]+$/.test(msg.model)) args.push("--model", msg.model);
-    if (EFFORT_LEVELS.has(msg.effort)) args.push("--effort", msg.effort);
-    const resume = !fresh && msg.sessionId && /^[\w-]+$/.test(msg.sessionId) ? msg.sessionId : null;
-    if (resume) args.push("--resume", resume);
-    const saved = fresh ? fresh.saved : this.saveAttachments(msg.attachments);
-    if (saved.length) args.push("--add-dir", nodeRequire("path").dirname(saved[0].path));
+    const model = msg.model && /^[\w.-]+$/.test(msg.model) ? msg.model : DEFAULT_SETTINGS.model;
+    const effort = EFFORT_LEVELS.has(msg.effort) ? msg.effort : DEFAULT_SETTINGS.effort;
+    return [mode, model, effort].join("|");
+  }
 
+  spawnClaude(sig, resume) {
+    const cp = nodeRequire("child_process");
+    const path = nodeRequire("path");
+    const fs = nodeRequire("fs");
+    const [mode, model, effort] = sig.split("|");
+    const attachRoot = path.join(this.tmp, "attachments");
+    fs.mkdirSync(attachRoot, { recursive: true });
+    const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+      "--include-partial-messages", "--append-system-prompt", SYSTEM_PROMPT, "--add-dir", attachRoot,
+      "--permission-mode", mode, "--model", model, "--effort", effort];
+    if (resume) args.push("--resume", resume);
     const proc = cp.spawn(this.claude, args, { cwd: this.config.vaultPath, env: process.env, windowsHide: true });
-    let sessionId = resume;
-    let pending = "";
-    let stderr = "";
-    let events = 0;
+    const c = { proc, sig, resumed: resume, sessionId: resume, turn: null, buf: "", stderr: "", dead: false, idleTimer: null };
+    this.chats.add(c);
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (chunk) => {
-      pending += chunk;
+      c.buf += chunk;
       let nl;
-      while ((nl = pending.indexOf("\n")) >= 0) {
-        const line = pending.slice(0, nl).trim();
-        pending = pending.slice(nl + 1);
+      while ((nl = c.buf.indexOf("\n")) >= 0) {
+        const line = c.buf.slice(0, nl).trim();
+        c.buf = c.buf.slice(nl + 1);
         if (!line) continue;
         let event;
         try { event = JSON.parse(line); } catch (e) { continue; }
-        if (event.session_id) sessionId = event.session_id;
-        events++;
-        ws.send({ type: "event", event });
+        if (event.session_id) c.sessionId = event.session_id;
+        if (!c.turn) continue;
+        // A resumed chat that doesn't exist here answers with an empty error result.
+        if (c.resumed && !c.turn.events && event.type === "result" && event.is_error && !event.num_turns) {
+          c.resumeFailed = true;
+          this.kill(c);
+          continue;
+        }
+        if (event.type !== "system") c.turn.events++;
+        c.turn.ws.send({ type: "event", event });
+        if (event.type === "result") this.finishTurn(c, event.is_error ? 1 : 0);
       }
     });
     proc.stderr.setEncoding("utf8");
-    proc.stderr.on("data", (d) => { stderr = (stderr + d).slice(-4000); });
-    const turn = { proc };
-    proc.on("error", (e) => {
-      ws.send({ type: "error", message: "Couldn't start Claude Code: " + e.message });
-      ws.send({ type: "done", sessionId, code: -1 });
-    });
-    proc.on("close", (code) => {
-      // A chat from another computer or an older setup can't be resumed here: start it fresh
-      // with the same message instead of failing.
-      if (code && resume && /No conversation found/i.test(stderr)) {
-        ws.send({ type: "notice", message: "Started a new conversation. The earlier one isn't on this computer." });
-        turn.proc = this.runTurn(ws, msg, { saved }).proc;
+    proc.stderr.on("data", (d) => { c.stderr = (c.stderr + d).slice(-4000); });
+    proc.stdin.on("error", () => { /* the close handler reports it */ });
+    const ended = (code, startError) => {
+      if (c.dead) return;
+      c.dead = true;
+      clearTimeout(c.idleTimer);
+      this.chats.delete(c);
+      if (this.spare === c) this.spare = null;
+      const t = c.turn;
+      c.turn = null;
+      if (!t) return;
+      // A chat from another computer or an older setup can't be resumed here: rerun the
+      // message as a new conversation instead of failing.
+      if (c.resumed && !t.events && (c.resumeFailed || /No conversation found/i.test(c.stderr))) {
+        t.ws.send({ type: "notice", message: "Started a new conversation. The earlier one isn't on this computer." });
+        this.runTurn(t.ws, Object.assign({}, t.msg, { sessionId: null }), t.saved);
         return;
       }
-      const err = stderr
-        .replace(/\S+ hook \[[\s\S]*?\] failed: Hook cancelled\s*/g, "")
-        .trim();
-      if (code && err && !(code === 143 || code === null)) ws.send({ type: "error", message: err.slice(-2000) });
-      ws.send({ type: "done", sessionId, code });
-    });
-    proc.stdin.end(this.buildPrompt(msg, saved));
-    return turn;
+      const err = startError || c.stderr.replace(/\S+ hook \[[\s\S]*?\] failed: Hook cancelled\s*/g, "").trim();
+      if (!c.interrupted && err) t.ws.send({ type: "error", message: err.slice(-2000) });
+      t.ws.send({ type: "done", sessionId: c.sessionId, code: c.interrupted ? 0 : (code || 1) });
+    };
+    proc.on("error", (e) => ended(-1, "Couldn't start Claude Code: " + e.message));
+    proc.on("close", (code) => ended(code));
+    return c;
+  }
+
+  finishTurn(c, code) {
+    const t = c.turn;
+    c.turn = null;
+    t.ws.send({ type: "done", sessionId: c.sessionId, code });
+    // Close processes that sit idle, and keep at most a few chats warm.
+    clearTimeout(c.idleTimer);
+    c.idleTimer = setTimeout(() => this.kill(c), 15 * 60 * 1000);
+    const idle = [...this.chats].filter((x) => x !== this.spare && !x.turn && !x.dead);
+    while (idle.length > 3) this.kill(idle.shift());
+  }
+
+  kill(c) {
+    if (!c || c.dead) return;
+    try { c.proc.stdin.end(); } catch (e) { /* closed */ }
+    try { c.proc.kill(); } catch (e) { /* gone */ }
+  }
+
+  ensureSpare(sig) {
+    if (this.stopped) return;
+    if (this.spare && !this.spare.dead && this.spare.sig === sig) return;
+    if (this.spare) this.kill(this.spare);
+    this.spare = this.spawnClaude(sig, null);
+  }
+
+  // Returns the chat process now running this turn.
+  runTurn(ws, msg, saved) {
+    if (!saved) saved = this.saveAttachments(msg.attachments);
+    const sig = this.signature(msg);
+    const sid = msg.sessionId && /^[\w-]+$/.test(msg.sessionId) ? msg.sessionId : null;
+    let c = null;
+    if (sid) {
+      for (const x of this.chats) if (!x.dead && x !== this.spare && x.sessionId === sid) c = x;
+      if (c && c.sig !== sig) { this.kill(c); c = null; }
+    } else if (this.spare && !this.spare.dead && this.spare.sig === sig) {
+      c = this.spare;
+      this.spare = null;
+    }
+    if (!c) c = this.spawnClaude(sig, sid);
+    clearTimeout(c.idleTimer);
+    c.interrupted = false;
+    c.turn = { ws, msg, saved, events: 0 };
+    ws.current = c;
+    c.proc.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: this.buildPrompt(msg, saved) } }) + "\n");
+    // Have the next new chat's process ready by the time it's wanted.
+    setTimeout(() => this.ensureSpare(sig), 4000);
+    return c;
   }
 
   // One Python process keeps the speech model loaded, so each recording takes about a second
@@ -1515,7 +1695,7 @@ class Host {
     if (!this.python) return null;
     const script = path.join(this.tmp, "transcribe.py");
     fs.writeFileSync(script, TRANSCRIBE_PY);
-    const proc = cp.spawn(this.python[0], [...this.python[1], script, "small"], {
+    const proc = cp.spawn(this.python[0], [...this.python[1], script, "base.en"], {
       windowsHide: true, env: Object.assign({}, process.env, { PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" }),
     });
     const w = { proc, queue: [], buf: "", err: "", dead: false };
