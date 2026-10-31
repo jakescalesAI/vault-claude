@@ -1,0 +1,9 @@
+{
+  "id": "vault-claude",
+  "name": "Vault Claude",
+  "version": "0.4.0",
+  "minAppVersion": "1.5.0",
+  "description": "A chat sidebar for Claude Code on your own computer and Claude subscription. Use it from your iPad or phone over Tailscale.",
+  "author": "Jake",
+  "isDesktopOnly": false
+}
