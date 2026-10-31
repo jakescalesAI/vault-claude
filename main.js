@@ -12,14 +12,14 @@ const DEFAULT_SETTINGS = {
   hostBind: "local", // "local" | "tailscale" | "all"
   claudePath: "",
   transcribeCommand: "",
-  model: "",
-  effort: "",
+  model: "opus",
+  effort: "medium",
   permissionMode: "acceptEdits",
   sendContext: true,
   sessions: [], // [{id, title, updated, pinned?, items: [...]}] newest first
 };
-const MODELS = [["", "Default"], ["opus", "Opus"], ["sonnet", "Sonnet"], ["haiku", "Haiku"]];
-const EFFORTS = [["", "Auto"], ["low", "Low"], ["medium", "Med"], ["high", "High"], ["max", "Max"]];
+const MODELS = [["opus", "Opus"], ["sonnet", "Sonnet"], ["haiku", "Haiku"]];
+const EFFORTS = [["low", "Low"], ["medium", "Med"], ["high", "High"], ["max", "Max"]];
 const MODES = [["acceptEdits", "Edit"], ["plan", "Plan"], ["default", "Read"]];
 const FILE_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
@@ -205,7 +205,7 @@ class VaultClaudeView extends ItemView {
   // Tint the brain when anything differs from the defaults, so the state is visible at a glance.
   updateBrain() {
     const s = this.plugin.settings;
-    this.brainBtn.toggleClass("is-custom", s.permissionMode !== "acceptEdits" || !!s.model || !!s.effort);
+    this.brainBtn.toggleClass("is-custom", s.permissionMode !== "acceptEdits" || s.model !== "opus" || s.effort !== "medium");
   }
 
   closeMenu() {
@@ -1552,6 +1552,9 @@ class VaultClaudeSettings extends PluginSettingTab {
 module.exports = class VaultClaudePlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    // Older versions saved "" for Default/Auto; those choices are gone.
+    if (!MODELS.some(([v]) => v === this.settings.model)) this.settings.model = DEFAULT_SETTINGS.model;
+    if (!EFFORTS.some(([v]) => v === this.settings.effort)) this.settings.effort = DEFAULT_SETTINGS.effort;
     this.host = null;
     this.hostError = "";
     this.registerView(VIEW_TYPE, (leaf) => new VaultClaudeView(leaf, this));
