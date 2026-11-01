@@ -9,6 +9,7 @@ const DEFAULT_SETTINGS = {
   serverUrl: "", // the host other devices connect to, e.g. ws://100.x.y.z:8787
   pairingCode: "", // made by the host; synced devices pick it up from data.json
   hostPort: 8787,
+  placement: "beside", // iPad: "beside" the note or "sidebar"
   hostBind: "local", // "local" | "tailscale" | "all"
   claudePath: "",
   transcribeCommand: "",
@@ -143,6 +144,22 @@ class VaultClaudeView extends ItemView {
 
     // Keep the last message clear of the floating composer, whatever its height.
     const fit = () => root.style.setProperty("--vc-composer-h", composer.offsetHeight + "px");
+    const vv = window.visualViewport;
+    if (vv && !Platform.isDesktopApp) {
+      const lift = () => {
+        const visibleBottom = vv.offsetTop + vv.height;
+        const kb = Math.max(0, Math.round(root.getBoundingClientRect().bottom - visibleBottom));
+        const was = this.kb || 0;
+        this.kb = kb;
+        root.style.setProperty("--vc-kb", kb + "px");
+        root.toggleClass("vc-keyboard", kb > 40);
+        if (kb > was && this.messagesEl) this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+      };
+      this.registerDomEvent(vv, "resize", lift);
+      this.registerDomEvent(vv, "scroll", lift);
+      this.registerDomEvent(this.inputEl, "focus", () => { window.setTimeout(lift, 50); window.setTimeout(lift, 400); });
+      this.registerDomEvent(this.inputEl, "blur", () => window.setTimeout(lift, 300));
+    }
     if (window.ResizeObserver) {
       const ro = new ResizeObserver(fit);
       ro.observe(composer);
@@ -313,6 +330,21 @@ class VaultClaudeView extends ItemView {
     }
   }
 
+  connectionAlert() {
+    const url = this.plugin.clientUrl();
+    const retry = { label: "Retry", primary: true, run: () => this.reconnect() };
+    const ok = { label: "OK" };
+    if (!url || this.state === "setup") return this.alert("Not Set Up", "Add your computer's address and pairing code in Vault Claude settings.", [{ label: "OK", primary: true }]);
+    if (this.state === "unpaired" || this.lastFail === "unpaired") return this.alert("Pairing Code Doesn't Match", "Your computer is reachable, but it rejected the pairing code. Copy the code from Vault Claude settings on your computer and paste it here.", [ok, retry]);
+    if (this.state === "connecting") return this.alert("Still Connecting", `Trying ${url}. Give it a few seconds, then send again.`, [ok, retry]);
+    const why = this.lastFail === "refused"
+      ? "Your computer answered but nothing is listening on that port. Check that Obsidian is open on it with this vault and that the address and port match its Vault Claude settings."
+      : "No answer from your computer. Check that it's awake with Obsidian open, and that Windows Firewall allows Obsidian on private networks.";
+    this.alert("Can't Reach Your Computer", `${url}
+
+${why}`, [ok, retry]);
+  }
+
   autosize() {
     this.inputEl.style.height = "auto";
     this.inputEl.style.height = Math.min(this.inputEl.scrollHeight, 160) + "px";
@@ -331,11 +363,14 @@ class VaultClaudeView extends ItemView {
     let ws;
     try { ws = new WebSocket(url); } catch (e) { this.setStatus("off"); return this.retry(); }
     this.ws = ws;
-    ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token: this.plugin.settings.pairingCode }));
+    const started = Date.now();
+    ws.onopen = () => { this.opened = true; ws.send(JSON.stringify({ type: "auth", token: this.plugin.settings.pairingCode })); };
     ws.onmessage = (e) => { try { this.onServer(JSON.parse(e.data)); } catch (err) { console.error("vault-claude", err); } };
     ws.onclose = () => {
       if (this.ws !== ws) return;
       const wasReady = this.ready;
+      this.lastFail = this.unpaired ? "unpaired" : ws.vcOpened || this.opened ? "closed" : Date.now() - started < 1500 ? "refused" : "timeout";
+      this.opened = false;
       this.ready = false;
       this.setStatus(this.unpaired ? "unpaired" : "off");
       if (this.running && wasReady) this.finishTurn(null, "Connection lost. Your computer keeps working; reopen this chat from Chats to see the result.");
@@ -360,6 +395,7 @@ class VaultClaudeView extends ItemView {
   }
 
   setStatus(state) {
+    this.state = state;
     this.statusDot.className = "vc-dot is-" + (state === "on" ? "on" : state === "connecting" ? "connecting" : "off");
     const local = this.plugin.hosting();
     this.statusText.setText({
@@ -606,7 +642,7 @@ class VaultClaudeView extends ItemView {
     const attachments = this.pending || [];
     if (!text && !attachments.length) return;
     if (!this.running && (!this.isReady())) {
-      this.alert("Not Connected", "Make sure Tailscale is on and your computer is awake with Obsidian open, then try again.", [{ label: "OK", primary: true }]);
+      this.connectionAlert();
       return;
     }
     const ctx = this.plugin.settings.sendContext ? this.currentContext() : {};
@@ -1948,6 +1984,13 @@ class VaultClaudeSettings extends PluginSettingTab {
       }
     }
 
+    if (Platform.isTablet) {
+      new Setting(containerEl)
+        .setName("Open chat")
+        .setDesc("Beside your note keeps both on screen. Sidebar slides over from the right.")
+        .addDropdown((d) => d.addOption("beside", "Beside the note").addOption("sidebar", "In the sidebar").setValue(s.placement || "beside")
+          .onChange(async (v) => { s.placement = v; await plugin.saveSettings(); plugin.app.workspace.detachLeavesOfType(VIEW_TYPE); await plugin.activate(); }));
+    }
     new Setting(containerEl).setName(Platform.isDesktopApp ? "Connect to another computer" : "Connect to your computer").setHeading();
     if (Platform.isDesktopApp && plugin.hostEnabled()) {
       containerEl.createDiv({ cls: "setting-item-description vc-settings-note", text: "This computer runs Claude Code itself, so it doesn't use these. They are what your other devices use." });
@@ -2082,9 +2125,12 @@ module.exports = class VaultClaudePlugin extends Plugin {
   }
 
   async activate() {
-    let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
+    const ws = this.app.workspace;
+    const beside = Platform.isTablet && this.settings.placement !== "sidebar";
+    let leaf = ws.getLeavesOfType(VIEW_TYPE)[0];
+    if (leaf && beside && leaf.getRoot() !== ws.rootSplit) { leaf.detach(); leaf = null; }
     if (!leaf) {
-      leaf = this.app.workspace.getRightLeaf(false);
+      leaf = beside ? ws.getLeaf("split", "vertical") : ws.getRightLeaf(false);
       await leaf.setViewState({ type: VIEW_TYPE, active: true });
     }
     this.app.workspace.revealLeaf(leaf);
