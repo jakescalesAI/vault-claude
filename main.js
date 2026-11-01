@@ -34,7 +34,7 @@ const ICONS = {
   chevronRight: '<path d="M9 6l6 6-6 6"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>',
   check: '<path d="M5 12.5l4.5 4.5L19 7"/>',
-  brain: '<path d="M9.5 4A2.5 2.5 0 0 0 7 6.5 3 3 0 0 0 4.5 11a3 3 0 0 0 .5 5 3 3 0 0 0 4.5 3.5 2.5 2.5 0 0 0 2.5-2V6a2.5 2.5 0 0 0-2.5-2z"/><path d="M14.5 4A2.5 2.5 0 0 1 17 6.5 3 3 0 0 1 19.5 11a3 3 0 0 1-.5 5 3 3 0 0 1-4.5 3.5 2.5 2.5 0 0 1-2.5-2V6a2.5 2.5 0 0 1 2.5-2z"/>',
+  brain: '<path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.967 17.484A4 4 0 0 1 18 18"/>',
   plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
   xmark: '<path d="M7 7l10 10"/><path d="M17 7L7 17"/>',
   paperclip: '<path d="M20 11.5l-7.8 7.8a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/>',
@@ -129,6 +129,15 @@ class VaultClaudeView extends ItemView {
     this.contextEl = controls.createDiv("vc-context");
     this.micBtn = this.iconButton(controls, "mic", "Dictate", () => this.toggleRecording());
     this.micBtn.addClass("vc-mic");
+    this.usageBtn = controls.createEl("button", { cls: "vc-icon-btn vc-usage", attr: { "aria-label": "Usage" } });
+    this.usageBtn.onclick = (e) => {
+      e.stopPropagation();
+      // A click keeps a hover-opened card open; a second click closes it.
+      if (this.menuEl && this.menuEl.hasClass("is-hover")) this.menuEl.removeClass("is-hover");
+      else this.openUsage();
+    };
+    this.usageBtn.onmouseenter = () => { if (!this.menuEl) this.openUsage(true); };
+    this.usageBtn.onmouseleave = () => { if (this.menuEl && this.menuEl.hasClass("is-hover")) this.closeMenu(); };
     this.brainBtn = this.iconButton(controls, "brain", "Mode, model and effort", (e) => { e.stopPropagation(); this.openSettingsMenu(); });
     this.brainBtn.addClass("vc-brain");
 
@@ -226,6 +235,52 @@ class VaultClaudeView extends ItemView {
   }
 
   // Tint the brain when anything differs from the defaults, so the state is visible at a glance.
+  // ---------- usage ----------
+  // A ring fills as the chat uses its context window; the popover adds plan limits, like Quartzi.
+  updateUsage() {
+    if (!this.usageBtn) return;
+    const c = (this.session && this.session.context) || {};
+    const frac = c.used && c.window ? Math.min(1, c.used / c.window) : 0;
+    const R = 7, C = 2 * Math.PI * R;
+    this.usageBtn.innerHTML = `<svg viewBox="0 0 20 20" class="vc-ring"><circle cx="10" cy="10" r="${R}" class="vc-ring-track"/><circle cx="10" cy="10" r="${R}" class="vc-ring-fill" stroke-dasharray="${C}" stroke-dashoffset="${C * (1 - frac)}"/></svg>`;
+    this.usageBtn.toggleClass("is-high", frac >= 0.8);
+    if (this.menuEl && this.menuEl.hasClass("vc-menu-usage")) { const hover = this.menuEl.hasClass("is-hover"); this.closeMenu(); this.openUsage(hover); }
+  }
+
+  openUsage(hover) {
+    if (this.closeMenu() && !hover) return;
+    const menu = this.root.createDiv("vc-menu vc-menu-usage vc-material" + (hover ? " is-hover" : ""));
+    menu.onclick = (e) => e.stopPropagation();
+    const bar = (label, sub, value, frac) => {
+      const row = menu.createDiv("vc-usage-row");
+      const head = row.createDiv("vc-usage-head");
+      const l = head.createSpan({ cls: "vc-usage-label", text: label });
+      if (sub) l.createSpan({ cls: "vc-usage-sub", text: " · " + sub });
+      head.createSpan({ cls: "vc-usage-value vc-num", text: value });
+      const track = row.createDiv("vc-usage-track");
+      const fill = track.createDiv("vc-usage-fill");
+      fill.style.width = Math.round(Math.min(1, Math.max(0, frac)) * 100) + "%";
+      if (frac >= 0.8) fill.addClass("is-high");
+    };
+    const c = (this.session && this.session.context) || {};
+    if (c.used && c.window) bar("Context window", "", `${tokens(c.used)} / ${tokens(c.window)} (${Math.round((c.used / c.window) * 100)}%)`, c.used / c.window);
+    else bar("Context window", "", "New chat", 0);
+    const info = this.plugin.settings.limits;
+    const windows = (info && info.unifiedWindows) || {};
+    const names = Object.keys(windows).sort((a, b) => (a === "five_hour" ? -1 : b === "five_hour" ? 1 : a.localeCompare(b)));
+    for (const k of names) {
+      const w = windows[k];
+      if (typeof w.utilization !== "number") continue;
+      bar(limitName(k), w.resetsAt ? "resets in " + untilText(w.resetsAt) : "", Math.round(w.utilization * 100) + "%", w.utilization);
+    }
+    if (!names.length) menu.createDiv({ cls: "vc-caption vc-usage-note", text: "Plan limits appear after your first reply." });
+    const r = this.usageBtn.getBoundingClientRect();
+    const box = this.root.getBoundingClientRect();
+    menu.style.right = `${Math.max(8, box.right - r.right)}px`;
+    menu.style.bottom = `${box.bottom - r.top + 6}px`;
+    this.menuEl = menu;
+  }
+
   updateBrain() {
     const s = this.plugin.settings;
     this.brainBtn.toggleClass("is-custom", s.permissionMode !== "acceptEdits" || s.model !== DEFAULT_SETTINGS.model || s.effort !== DEFAULT_SETTINGS.effort);
@@ -435,6 +490,7 @@ class VaultClaudeView extends ItemView {
   }
 
   renderSession() {
+    window.setTimeout(() => this.updateUsage(), 0);
     this.messagesEl.empty();
     this.toolEls.clear();
     this.live = null;
@@ -668,6 +724,23 @@ class VaultClaudeView extends ItemView {
     const ev = msg.event;
 
     if (ev.type === "system" && ev.subtype === "init" && ev.session_id) this.session.id = ev.session_id;
+    if (ev.type === "rate_limit_event" && ev.rate_limit_info) {
+      this.plugin.settings.limits = Object.assign({}, ev.rate_limit_info, { seen: Date.now() });
+      this.updateUsage();
+    }
+    // Each top-level API call's usage is what the conversation now takes up.
+    if (ev.type === "assistant" && !ev.parent_tool_use_id && ev.message && ev.message.usage) {
+      const u = ev.message.usage;
+      const used = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.output_tokens || 0);
+      if (used) this.session.context = Object.assign({}, this.session.context, { used, model: ev.message.model });
+      this.updateUsage();
+    }
+    if (ev.type === "result" && ev.modelUsage) {
+      const ctx = this.session.context || {};
+      const m = (ctx.model && ev.modelUsage[ctx.model]) || Object.values(ev.modelUsage).sort((a, b) => (b.cacheReadInputTokens + b.inputTokens) - (a.cacheReadInputTokens + a.inputTokens))[0];
+      if (m && m.contextWindow) this.session.context = Object.assign({}, ctx, { window: m.contextWindow });
+      this.updateUsage();
+    }
 
     if (ev.type === "stream_event") {
       const e = ev.event || {};
@@ -1174,6 +1247,28 @@ class VaultClaudeView extends ItemView {
 }
 
 const MAX_ATTACHMENT = 20 * 1048576;
+
+function tokens(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
+  return String(n);
+}
+
+function untilText(resetsAt) {
+  const ms = resetsAt * 1000 - Date.now();
+  if (ms <= 0) return "now";
+  const h = Math.floor(ms / 3600000);
+  const d = Math.floor(h / 24);
+  return d ? `${d}d ${h % 24}h` : h ? `${h}h ${Math.floor((ms % 3600000) / 60000)}m` : `${Math.max(1, Math.round(ms / 60000))}m`;
+}
+
+// five_hour -> Session, seven_day -> Weekly, seven_day_opus -> Weekly (Opus)
+function limitName(key) {
+  if (key === "five_hour") return "Session";
+  const m = /^seven_day(?:_(.+))?$/.exec(key);
+  if (m) return m[1] ? `Weekly (${m[1].replace(/_/g, " ").replace(/\b\w/g, (x) => x.toUpperCase())})` : "Weekly";
+  return key.replace(/_/g, " ");
+}
 
 function excerpt(text) {
   const t = String(text || "").replace(/\s+/g, " ").trim();

@@ -514,6 +514,24 @@ body.theme-dark .vc-root {
 .vc-menu-label { flex: 1; }
 .vc-menu-ico { color: var(--vc-text-2); }
 
+/* ---------- usage ring and card ---------- */
+.vc-usage { color: var(--vc-text-2) !important; }
+.vc-ring { width: 19px; height: 19px; transform: rotate(-90deg); }
+.vc-ring circle { fill: none; stroke-width: 2.4; }
+.vc-ring-track { stroke: var(--vc-fill); }
+.vc-ring-fill { stroke: var(--vc-blue); stroke-linecap: round; transition: stroke-dashoffset 0.35s var(--vc-ease); }
+.vc-usage.is-high .vc-ring-fill { stroke: var(--vc-orange, #ff9500); }
+.vc-menu-usage { width: 300px; max-width: calc(100% - 16px); padding: 12px 14px 4px; }
+.vc-usage-row { margin-bottom: 12px; }
+.vc-usage-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 6px; font-size: 13px; }
+.vc-usage-label { color: var(--vc-text); }
+.vc-usage-sub { color: var(--vc-text-2); }
+.vc-usage-value { font-weight: 600; white-space: nowrap; }
+.vc-usage-track { height: 6px; border-radius: 3px; background: var(--vc-fill); overflow: hidden; }
+.vc-usage-fill { height: 100%; border-radius: 3px; background: var(--vc-blue); transition: width 0.35s var(--vc-ease); }
+.vc-usage-fill.is-high { background: var(--vc-orange, #ff9500); }
+.vc-usage-note { padding: 0 0 10px; }
+
 /* ---------- replies ---------- */
 .vc-reply-bar { display: none; }
 .vc-reply-bar.is-on {
