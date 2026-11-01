@@ -1,8 +1,8 @@
-/* Vault Claude: a chat sidebar for Claude Code, on your own computer and your own Claude login.
+/* Quartzi Copilot: a chat sidebar for Claude Code, on your own computer and your own Claude login.
    On a desktop the plugin hosts Claude Code itself (see Host below) and other devices (iPad,
    phone) connect to it over Tailscale with a pairing code. The chat UI uses no Node APIs, so it
    runs on mobile. Styled after Apple's HIG; see styles.css. */
-const { Plugin, ItemView, PluginSettingTab, Setting, MarkdownRenderer, MarkdownView, Platform, Notice } = require("obsidian");
+const { addIcon, Plugin, ItemView, PluginSettingTab, Setting, MarkdownRenderer, MarkdownView, Platform, Notice } = require("obsidian");
 
 const VIEW_TYPE = "vault-claude-view";
 const DEFAULT_SETTINGS = {
@@ -16,12 +16,15 @@ const DEFAULT_SETTINGS = {
   model: "sonnet",
   effort: "medium",
   permissionMode: "acceptEdits",
+  provider: "claude",
+  providerModel: "",
   sendContext: true,
   sessions: [], // [{id, title, updated, pinned?, items: [...]}] newest first
 };
-const MODELS = [["sonnet", "Sonnet"], ["opus", "Opus"], ["haiku", "Haiku"]];
+const MODELS = [["fable", "Fable"], ["opus", "Opus"], ["sonnet", "Sonnet"], ["haiku", "Haiku"]];
+const QUARTZI_MARK = '<g transform="scale(1.5625)" fill="currentColor"><polygon points="35.54,12.91 39.42,16.80 16.80,39.42 12.91,35.54"/><polygon opacity=".85" points="39.42,16.80 47.20,24.58 24.58,47.20 16.80,39.42"/><polygon opacity=".45" points="47.20,24.58 51.09,28.46 28.46,51.09 24.58,47.20"/><polygon opacity=".95" points="35.54,12.91 39.42,16.80 51.09,12.91"/><polygon opacity=".9" points="39.42,16.80 47.20,24.58 51.09,12.91"/><polygon opacity=".55" points="47.20,24.58 51.09,28.46 51.09,12.91"/><polygon opacity=".93" points="12.91,35.54 16.80,39.42 12.91,51.09"/><polygon opacity=".78" points="16.80,39.42 24.58,47.20 12.91,51.09"/><polygon opacity=".35" points="24.58,47.20 28.46,51.09 12.91,51.09"/></g>';
 const EFFORTS = [["low", "Low"], ["medium", "Med"], ["high", "High"], ["max", "Max"]];
-const MODES = [["acceptEdits", "Edit"], ["plan", "Plan"], ["default", "Read"]];
+const MODES = [["auto", "Auto"], ["acceptEdits", "Edit"], ["plan", "Plan"], ["default", "Read"]];
 const FILE_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
 // SF Symbols-style line icons: 24px grid, stroke 2, round caps.
@@ -69,8 +72,8 @@ class VaultClaudeView extends ItemView {
   }
 
   getViewType() { return VIEW_TYPE; }
-  getDisplayText() { return "Claude"; }
-  getIcon() { return "sparkles"; }
+  getDisplayText() { return "Quartzi Copilot"; }
+  getIcon() { return "quartzi"; }
 
   async onOpen() {
     const root = this.containerEl.children[1];
@@ -130,7 +133,7 @@ class VaultClaudeView extends ItemView {
     this.contextEl = controls.createDiv("vc-context");
     this.micBtn = this.iconButton(controls, "mic", "Dictate", () => this.toggleRecording());
     this.micBtn.addClass("vc-mic");
-    this.usageBtn = controls.createEl("button", { cls: "vc-icon-btn vc-usage", attr: { "aria-label": "Usage" } });
+    this.usageBtn = controls.createEl("button", { cls: "vc-icon-btn vc-usage", attr: { "aria-description": "Usage" } });
     this.usageBtn.onclick = (e) => {
       e.stopPropagation();
       // A click keeps a hover-opened card open; a second click closes it.
@@ -141,6 +144,7 @@ class VaultClaudeView extends ItemView {
     this.usageBtn.onmouseleave = () => { if (this.menuEl && this.menuEl.hasClass("is-hover")) this.closeMenu(); };
     this.brainBtn = this.iconButton(controls, "brain", "Mode, model and effort", (e) => { e.stopPropagation(); this.openSettingsMenu(); });
     this.brainBtn.addClass("vc-brain");
+    this.updateUsage();
 
     // Keep the last message clear of the floating composer, whatever its height.
     const fit = () => root.style.setProperty("--vc-composer-h", composer.offsetHeight + "px");
@@ -242,13 +246,30 @@ class VaultClaudeView extends ItemView {
       this.segmented(menu, options, s[key], (v) => { s[key] = v; this.plugin.saveSettings(); this.updateBrain(); });
     };
     group("Mode", MODES, "permissionMode");
-    group("Model", MODELS, "model");
-    group("Effort", EFFORTS, "effort");
-    const r = this.brainBtn.getBoundingClientRect();
-    const box = this.root.getBoundingClientRect();
-    menu.style.right = `${Math.max(8, box.right - r.right)}px`;
-    menu.style.bottom = `${box.bottom - r.top + 4}px`;
-    this.menuEl = menu;
+    const pick = (title, options, value, onChange) => {
+      menu.createDiv({ cls: "vc-menu-section", text: title });
+      const sel = menu.createEl("select", { cls: "dropdown vc-select" });
+      for (const [v, label] of options) sel.createEl("option", { text: label, attr: { value: v } });
+      sel.value = value;
+      sel.onchange = () => onChange(sel.value);
+    };
+    const providers = this.providers || [];
+    const provider = providers.find((x) => x.id === s.provider);
+    const redraw = () => { this.plugin.saveSettings(); this.updateBrain(); this.closeMenu(); this.openSettingsMenu(); };
+    pick("Provider", [["claude", "Claude"], ...providers.map((x) => [x.id, x.name])], provider ? s.provider : "claude", (v) => {
+      s.provider = v;
+      const next = providers.find((x) => x.id === v);
+      s.providerModel = next ? next.models[0] || "" : "";
+      redraw();
+    });
+    if (provider) {
+      pick("Model", provider.models.map((m) => [m, m.replace(/^models\//, "")]), s.providerModel, (v) => { s.providerModel = v; redraw(); });
+    } else {
+      group("Model", MODELS, "model");
+      group("Effort", EFFORTS, "effort");
+    }
+    if (!providers.length) menu.createDiv({ cls: "vc-caption vc-usage-note", text: "Add other providers in Quartzi Copilot settings on your computer." });
+    this.placeMenu(menu, this.brainBtn, 4);
   }
 
   // Tint the brain when anything differs from the defaults, so the state is visible at a glance.
@@ -282,7 +303,8 @@ class VaultClaudeView extends ItemView {
     const c = (this.session && this.session.context) || {};
     if (c.used && c.window) bar("Context window", "", `${tokens(c.used)} / ${tokens(c.window)} (${Math.round((c.used / c.window) * 100)}%)`, c.used / c.window);
     else bar("Context window", "", "New chat", 0);
-    const info = this.plugin.settings.limits;
+    const onClaude = this.plugin.settings.provider === "claude";
+    const info = onClaude ? this.plugin.settings.limits : null;
     const windows = (info && info.unifiedWindows) || {};
     const names = Object.keys(windows).sort((a, b) => (a === "five_hour" ? -1 : b === "five_hour" ? 1 : a.localeCompare(b)));
     for (const k of names) {
@@ -290,17 +312,23 @@ class VaultClaudeView extends ItemView {
       if (typeof w.utilization !== "number") continue;
       bar(limitName(k), w.resetsAt ? "resets in " + untilText(w.resetsAt) : "", Math.round(w.utilization * 100) + "%", w.utilization);
     }
-    if (!names.length) menu.createDiv({ cls: "vc-caption vc-usage-note", text: "Plan limits appear after your first reply." });
-    const r = this.usageBtn.getBoundingClientRect();
+    if (!names.length && onClaude) menu.createDiv({ cls: "vc-caption vc-usage-note", text: "Plan limits appear after your first reply." });
+    this.placeMenu(menu, this.usageBtn, 6);
+  }
+
+  // Opens above the anchor, lined up with it, but never past either edge of the pane.
+  placeMenu(menu, anchor, gap) {
+    const r = anchor.getBoundingClientRect();
     const box = this.root.getBoundingClientRect();
-    menu.style.right = `${Math.max(8, box.right - r.right)}px`;
-    menu.style.bottom = `${box.bottom - r.top + 6}px`;
+    const wanted = box.right - r.right;
+    menu.style.right = `${Math.max(8, Math.min(wanted, box.width - menu.offsetWidth - 8))}px`;
+    menu.style.bottom = `${box.bottom - r.top + gap}px`;
     this.menuEl = menu;
   }
 
   updateBrain() {
     const s = this.plugin.settings;
-    this.brainBtn.toggleClass("is-custom", s.permissionMode !== "acceptEdits" || s.model !== DEFAULT_SETTINGS.model || s.effort !== DEFAULT_SETTINGS.effort);
+    this.brainBtn.toggleClass("is-custom", s.provider !== "claude" || s.permissionMode !== "acceptEdits" || s.model !== DEFAULT_SETTINGS.model || s.effort !== DEFAULT_SETTINGS.effort);
   }
 
   closeMenu() {
@@ -334,11 +362,11 @@ class VaultClaudeView extends ItemView {
     const url = this.plugin.clientUrl();
     const retry = { label: "Retry", primary: true, run: () => this.reconnect() };
     const ok = { label: "OK" };
-    if (!url || this.state === "setup") return this.alert("Not Set Up", "Add your computer's address and pairing code in Vault Claude settings.", [{ label: "OK", primary: true }]);
-    if (this.state === "unpaired" || this.lastFail === "unpaired") return this.alert("Pairing Code Doesn't Match", "Your computer is reachable, but it rejected the pairing code. Copy the code from Vault Claude settings on your computer and paste it here.", [ok, retry]);
+    if (!url || this.state === "setup") return this.alert("Not Set Up", "Add your computer's address and pairing code in Quartzi Copilot settings.", [{ label: "OK", primary: true }]);
+    if (this.state === "unpaired" || this.lastFail === "unpaired") return this.alert("Pairing Code Doesn't Match", "Your computer is reachable, but it rejected the pairing code. Copy the code from Quartzi Copilot settings on your computer and paste it here.", [ok, retry]);
     if (this.state === "connecting") return this.alert("Still Connecting", `Trying ${url}. Give it a few seconds, then send again.`, [ok, retry]);
     const why = this.lastFail === "refused"
-      ? "Your computer answered but nothing is listening on that port. Check that Obsidian is open on it with this vault and that the address and port match its Vault Claude settings."
+      ? "Your computer answered but nothing is listening on that port. Check that Obsidian is open on it with this vault and that the address and port match its Quartzi Copilot settings."
       : "No answer from your computer. Check that it's awake with Obsidian open, and that Windows Firewall allows Obsidian on private networks.";
     this.alert("Can't Reach Your Computer", `${url}
 
@@ -403,7 +431,7 @@ ${why}`, [ok, retry]);
       off: "Not connected",
       connecting: "Connecting…",
       unpaired: "Not paired · add the pairing code in settings",
-      setup: "Set up in Vault Claude settings",
+      setup: "Set up in Quartzi Copilot settings",
     }[state]);
   }
 
@@ -453,7 +481,7 @@ ${why}`, [ok, retry]);
     const many = notes.length > 1;
     const chip = this.contextEl.createEl("button", {
       cls: "vc-chip" + (on ? "" : " is-off"),
-      attr: { "aria-label": many ? "Choose which open notes Claude sees" : "Include or leave out the open note" },
+      attr: { "aria-label": many ? "Choose which open notes Copilot sees" : "Include or leave out the open note" },
     });
     icon(chip, "doc", "vc-ico-sm");
     const lead = included[0] || notes[0];
@@ -476,7 +504,7 @@ ${why}`, [ok, retry]);
     if (this.closeMenu()) return;
     const menu = this.root.createDiv("vc-menu vc-menu-notes vc-material");
     menu.onclick = (e) => e.stopPropagation();
-    menu.createDiv({ cls: "vc-menu-section", text: "Open notes Claude can see" });
+    menu.createDiv({ cls: "vc-menu-section", text: "Open notes Copilot can see" });
     const list = menu.createDiv("vc-menu-list");
     const s = this.plugin.settings;
     const draw = () => {
@@ -543,9 +571,9 @@ ${why}`, [ok, retry]);
 
   renderEmpty() {
     const empty = this.messagesEl.createDiv("vc-empty");
-    icon(empty, "sparkle", "vc-empty-ico");
-    empty.createDiv({ cls: "vc-large-title", text: "Claude" });
-    empty.createDiv({ cls: "vc-empty-sub", text: "Claude Code on your computer, working in this vault. It sees the notes you have open." });
+    empty.createDiv("vc-empty-ico vc-empty-mark").innerHTML = `<svg viewBox="0 0 100 100">${QUARTZI_MARK}</svg>`;
+    empty.createDiv({ cls: "vc-large-title", text: "Quartzi Copilot" });
+    empty.createDiv({ cls: "vc-empty-sub", text: "Your models, working in this vault from your computer. It sees the notes you have open." });
     const card = empty.createDiv("vc-card vc-suggestions");
     for (const s of ["Plan my day", "Summarize this note", "What should I work on next?"]) {
       const row = card.createEl("button", { cls: "vc-row" });
@@ -705,6 +733,7 @@ ${why}`, [ok, retry]);
       text: entries.map((e) => (e.reply ? quoteFor(e.reply) : "") + (e.text || "")).filter(Boolean).join("\n\n") || "(See the attached files.)",
       sessionId: this.session.id,
       model: s.model, effort: s.effort, permissionMode: s.permissionMode,
+      provider: s.provider, providerModel: s.providerModel,
       context: entries[entries.length - 1].ctx,
       attachments: entries.flatMap((e) => (e.attachments || []).map((a) => ({ name: a.name, mime: a.mime, data: a.data }))),
     }));
@@ -745,6 +774,7 @@ ${why}`, [ok, retry]);
     if (msg.type === "hello") {
       this.vaultRoot = msg.vaultRoot || "";
       this.hostName = msg.host || "";
+      this.ws.send(JSON.stringify({ type: "models" }));
       this.ready = true;
       this.unpaired = false;
       this.setStatus("on");
@@ -753,6 +783,12 @@ ${why}`, [ok, retry]);
     }
     if (msg.type === "transcript") { this.onTranscript(msg); return; }
     if (msg.type === "notice") { this.session.id = null; this.toast(msg.message.split(".")[0]); return; }
+    if (msg.type === "models") {
+      this.providers = msg.providers || [];
+      const s = this.plugin.settings;
+      if (s.provider !== "claude" && !this.providers.some((x) => x.id === s.provider)) { s.provider = "claude"; this.plugin.saveSettings(); this.updateBrain(); }
+      return;
+    }
     if (msg.type === "error" && msg.code === "auth") { this.unpaired = true; this.setStatus("unpaired"); return; }
     if (msg.type === "error") { this.addItem({ kind: "error", text: msg.message }); return; }
     if (msg.type === "done") { this.finishTurn(msg.sessionId); return; }
@@ -1165,7 +1201,7 @@ ${why}`, [ok, retry]);
     const selected = sel && !sel.isCollapsed && el.contains(sel.anchorNode) ? sel.toString().trim() : "";
     const menu = this.root.createDiv("vc-menu vc-menu-msg vc-material");
     menu.onclick = (e) => e.stopPropagation();
-    menu.createDiv({ cls: "vc-menu-time vc-caption vc-num", text: (item.kind === "user" ? "You · " : "Claude · ") + (item.at ? whenText(item.at) : "Earlier") });
+    menu.createDiv({ cls: "vc-menu-time vc-caption vc-num", text: (item.kind === "user" ? "You · " : "Copilot · ") + (item.at ? whenText(item.at) : "Earlier") });
     const row = (name, label, run) => {
       const b = menu.createEl("button", { cls: "vc-menu-row" });
       b.createSpan({ cls: "vc-menu-label", text: label });
@@ -1193,7 +1229,7 @@ ${why}`, [ok, retry]);
     if (!reply) return;
     icon(this.replyEl, "reply", "vc-ico-sm vc-reply-ico");
     const body = this.replyEl.createDiv("vc-reply-body");
-    body.createDiv({ cls: "vc-reply-who", text: reply.who === "you" ? "Replying to yourself" : "Replying to Claude" });
+    body.createDiv({ cls: "vc-reply-who", text: reply.who === "you" ? "Replying to yourself" : "Replying to Copilot" });
     body.createDiv({ cls: "vc-reply-text", text: reply.text });
     const x = this.iconButton(this.replyEl, "xmark", "Cancel reply", () => this.setReply(null));
     x.addClass("vc-reply-x");
@@ -1214,7 +1250,7 @@ ${why}`, [ok, retry]);
       this.renderAttachments(wrap, item.files);
       if (item.reply) {
         const q = wrap.createDiv("vc-reply-quote");
-        q.createDiv({ cls: "vc-reply-who", text: item.reply.who === "you" ? "You" : "Claude" });
+        q.createDiv({ cls: "vc-reply-who", text: item.reply.who === "you" ? "You" : "Copilot" });
         q.createDiv({ cls: "vc-reply-text", text: item.reply.text });
       }
       if (item.text) wrap.createDiv({ cls: "vc-bubble", text: item.text }).vcItem = item;
@@ -1371,7 +1407,7 @@ function toolLabel(item) {
 // plugin still runs on mobile, where these modules don't exist.
 // ====================================================================================
 
-const SYSTEM_PROMPT = `You are running inside the user's Obsidian vault through the "Vault Claude" sidebar,
+const SYSTEM_PROMPT = `You are running inside the user's Obsidian vault through the "Quartzi Copilot" sidebar,
 possibly on their iPad or phone. The vault is your working directory. Cite notes as [[note title]];
 those links are clickable in the sidebar. Edit notes with your Edit/Write tools. Keep replies
 readable on a narrow sidebar.`;
@@ -1395,8 +1431,212 @@ for line in sys.stdin:
         print(json.dumps({"error": str(e)}), flush=True)
 `;
 
-const PERMISSION_MODES = new Set(["acceptEdits", "plan", "default"]);
+const PERMISSION_MODES = new Set(["auto", "acceptEdits", "plan", "default"]);
 const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+// Providers Claude Code reaches through the local translator. "env" is an API key variable
+// already on this computer; keys typed in settings stay on this device, outside the synced vault.
+const PROVIDERS = {
+  claude: { name: "Claude" },
+  openai: { name: "OpenAI", base: "https://api.openai.com/v1", env: "OPENAI_API_KEY" },
+  gemini: { name: "Google Gemini", base: "https://generativelanguage.googleapis.com/v1beta/openai", env: "GEMINI_API_KEY" },
+  deepseek: { name: "DeepSeek", base: "https://api.deepseek.com/v1", env: "DEEPSEEK_API_KEY" },
+  xai: { name: "xAI Grok", base: "https://api.x.ai/v1", env: "XAI_API_KEY" },
+  openrouter: { name: "OpenRouter", base: "https://openrouter.ai/api/v1", env: "OPENROUTER_API_KEY" },
+  groq: { name: "Groq", base: "https://api.groq.com/openai/v1", env: "GROQ_API_KEY" },
+  mistral: { name: "Mistral", base: "https://api.mistral.ai/v1", env: "MISTRAL_API_KEY", noUsage: true },
+  moonshot: { name: "Moonshot Kimi", base: "https://api.moonshot.ai/v1", env: "MOONSHOT_API_KEY" },
+  zai: { name: "Z.ai GLM", base: "https://api.z.ai/api/paas/v4", env: "ZAI_API_KEY" },
+  together: { name: "Together AI", base: "https://api.together.xyz/v1", env: "TOGETHER_API_KEY" },
+  ollama: { name: "Ollama (local)", base: "http://127.0.0.1:11434/v1", local: true },
+  lmstudio: { name: "LM Studio (local)", base: "http://127.0.0.1:1234/v1", local: true },
+  custom: { name: "Custom" },
+};
+
+// Not chat models, so never offered in the picker.
+const NOT_CHAT = /embed|tts|whisper|transcri|moderation|image|imagen|veo|lyria|banana|audio|realtime|live|robotics|aqa|dall-e|sora|rerank|computer-use|deep-research|antigravity/i;
+
+function upstream(cfg, path, body) {
+  const url = new URL(cfg.base + path);
+  const lib = nodeRequire(url.protocol === "https:" ? "https" : "http");
+  const headers = { "content-type": "application/json" };
+  if (cfg.key) headers.authorization = "Bearer " + cfg.key;
+  const payload = body ? JSON.stringify(body) : null;
+  return new Promise((resolve, reject) => {
+    const req = lib.request(url, { method: body ? "POST" : "GET", headers }, resolve);
+    req.on("error", reject);
+    req.setTimeout(cfg.local ? 300000 : 120000, () => req.destroy(new Error("The provider took too long to answer.")));
+    req.end(payload);
+  });
+}
+
+function readAll(res) {
+  return new Promise((resolve, reject) => {
+    let s = "";
+    res.setEncoding("utf8");
+    res.on("data", (d) => { s += d; });
+    res.on("end", () => resolve(s));
+    res.on("error", reject);
+  });
+}
+
+async function listModels(cfg) {
+  try {
+    const res = await upstream(cfg, "/models");
+    if (res.statusCode !== 200) { res.resume(); return []; }
+    const list = JSON.parse(await readAll(res)).data || [];
+    return list.map((m) => m.id).filter((id) => id && !NOT_CHAT.test(id)).sort();
+  } catch (e) { return []; }
+}
+
+// Some providers reject JSON Schema keywords that Claude Code's tools use.
+function cleanSchema(v) {
+  if (Array.isArray(v)) return v.map(cleanSchema);
+  if (!v || typeof v !== "object") return v;
+  const out = {};
+  for (const k of Object.keys(v)) if (k !== "$schema" && k !== "propertyNames") out[k] = cleanSchema(v[k]);
+  return out;
+}
+
+// Anthropic Messages request -> OpenAI chat completions request. memo keeps what a provider must
+// see again on the next request (DeepSeek reasoning, Gemini thought signatures) by tool call id.
+function toOpenAI(body, cfg, memo) {
+  const messages = [];
+  const textOf = (c) => (typeof c === "string" ? c : (c || []).filter((b) => b.type === "text").map((b) => b.text).join("\n"));
+  const system = textOf(body.system);
+  if (system) messages.push({ role: "system", content: system });
+  for (const m of body.messages || []) {
+    const blocks = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content || [];
+    if (m.role === "assistant") {
+      const out = { role: "assistant", content: blocks.filter((b) => b.type === "text").map((b) => b.text).join("") || null };
+      const calls = blocks.filter((b) => b.type === "tool_use");
+      if (calls.length) {
+        out.tool_calls = calls.map((b) => {
+          const call = { id: b.id, type: "function", function: { name: b.name, arguments: JSON.stringify(b.input || {}) } };
+          const seen = memo.get(b.id);
+          if (seen && seen.extra) call.extra_content = seen.extra;
+          if (seen && seen.reasoning) out.reasoning_content = seen.reasoning;
+          return call;
+        });
+      }
+      messages.push(out);
+      continue;
+    }
+    for (const b of blocks) {
+      if (b.type !== "tool_result") continue;
+      const text = typeof b.content === "string" ? b.content : (b.content || []).map((c) => (c.type === "text" ? c.text : "[" + c.type + " omitted]")).join("\n");
+      messages.push({ role: "tool", tool_call_id: b.tool_use_id, content: (b.is_error ? "Error: " : "") + text });
+    }
+    const parts = [];
+    for (const b of blocks) {
+      if (b.type === "text") parts.push({ type: "text", text: b.text });
+      else if (b.type === "image" && b.source && b.source.type === "base64") parts.push({ type: "image_url", image_url: { url: `data:${b.source.media_type};base64,${b.source.data}` } });
+    }
+    if (parts.length) messages.push({ role: "user", content: parts.every((x) => x.type === "text") ? parts.map((x) => x.text).join("\n") : parts });
+  }
+  const out = { model: body.model, messages, stream: !!body.stream };
+  if (body.stream && !cfg.noUsage) out.stream_options = { include_usage: true };
+  if (body.tools && body.tools.length) {
+    out.tools = body.tools.filter((t) => t.input_schema).map((t) => ({ type: "function", function: { name: t.name, description: t.description || "", parameters: cleanSchema(t.input_schema) } }));
+    if (!out.tools.length) delete out.tools;
+  }
+  return out;
+}
+
+const STOP_REASONS = { tool_calls: "tool_use", length: "max_tokens", content_filter: "refusal" };
+
+// Runs one request against the provider and answers in Anthropic's format.
+async function translateTurn(cfg, body, res, memo, fail) {
+  let up;
+  try { up = await upstream(cfg, "/chat/completions", toOpenAI(body, cfg, memo)); }
+  catch (e) { return fail(502, `${cfg.name}: ${e.message}`); }
+  if (up.statusCode !== 200) {
+    const text = await readAll(up).catch(() => "");
+    let detail = text.slice(0, 500);
+    try { let j = JSON.parse(text); if (Array.isArray(j)) j = j[0]; detail = (j.error && j.error.message) || detail; } catch (e) { /* keep raw */ }
+    return fail(up.statusCode, `${cfg.name}: ${detail}`);
+  }
+  const id = "msg_" + Date.now().toString(36);
+  const remember = (call, reasoning) => {
+    if (!call.extra && !reasoning) return;
+    if (memo.size > 2000) memo.delete(memo.keys().next().value);
+    memo.set(call.id, { extra: call.extra, reasoning });
+  };
+
+  if (!body.stream) {
+    const j = JSON.parse(await readAll(up));
+    const c = (j.choices || [])[0] || {};
+    const m = c.message || {};
+    const content = [];
+    if (m.content) content.push({ type: "text", text: m.content });
+    for (const t of m.tool_calls || []) {
+      remember({ id: t.id, extra: t.extra_content }, m.reasoning_content);
+      let input = {};
+      try { input = JSON.parse(t.function.arguments || "{}"); } catch (e) { /* empty */ }
+      content.push({ type: "tool_use", id: t.id, name: t.function.name, input });
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ id, type: "message", role: "assistant", model: body.model, content, stop_reason: STOP_REASONS[c.finish_reason] || "end_turn", stop_sequence: null,
+      usage: { input_tokens: (j.usage && j.usage.prompt_tokens) || 0, output_tokens: (j.usage && j.usage.completion_tokens) || 0 } }));
+  }
+
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+  const emit = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify(Object.assign({ type }, data))}\n\n`);
+  emit("message_start", { message: { id, type: "message", role: "assistant", model: body.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+  let index = -1, open = null, reasoning = "", stop = "end_turn";
+  let usage = { input_tokens: 0, output_tokens: 0 };
+  const calls = new Map();
+  const closeBlock = () => { if (open) emit("content_block_stop", { index }); open = null; };
+  const onChunk = (j) => {
+    if (j.usage) usage = { input_tokens: j.usage.prompt_tokens || 0, output_tokens: j.usage.completion_tokens || 0 };
+    const c = (j.choices || [])[0];
+    if (!c) return;
+    const d = c.delta || {};
+    if (d.reasoning_content) reasoning += d.reasoning_content;
+    if (d.content) {
+      if (open !== "text") { closeBlock(); index++; open = "text"; emit("content_block_start", { index, content_block: { type: "text", text: "" } }); }
+      emit("content_block_delta", { index, delta: { type: "text_delta", text: d.content } });
+    }
+    for (const [pos, t] of (d.tool_calls || []).entries()) {
+      const key = t.index !== undefined ? t.index : pos;
+      let call = calls.get(key);
+      if (!call) {
+        closeBlock(); index++;
+        call = { id: t.id || `call_${id}_${key}`, extra: t.extra_content, block: index };
+        calls.set(key, call);
+        open = "tool";
+        emit("content_block_start", { index, content_block: { type: "tool_use", id: call.id, name: t.function.name, input: {} } });
+      }
+      if (t.extra_content) call.extra = t.extra_content;
+      const args = t.function && t.function.arguments;
+      if (args) emit("content_block_delta", { index: call.block, delta: { type: "input_json_delta", partial_json: args } });
+    }
+    if (c.finish_reason) stop = STOP_REASONS[c.finish_reason] || "end_turn";
+  };
+  let buf = "";
+  up.setEncoding("utf8");
+  up.on("data", (chunk) => {
+    buf += chunk;
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") continue;
+      try { onChunk(JSON.parse(data)); } catch (e) { /* skip a bad chunk */ }
+    }
+  });
+  const finish = () => {
+    closeBlock();
+    for (const call of calls.values()) remember(call, reasoning);
+    emit("message_delta", { delta: { stop_reason: calls.size ? "tool_use" : stop, stop_sequence: null }, usage });
+    emit("message_stop", {});
+    res.end();
+  };
+  up.on("end", finish);
+  up.on("error", finish);
+}
+
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 function nodeRequire(name) {
@@ -1573,7 +1813,7 @@ class Host {
     for (const h of hosts) {
       const server = http.createServer((req, res) => {
         res.writeHead(200, { "Content-Type": "text/plain" });
-        res.end("Vault Claude host. Connect from the Obsidian plugin.\n");
+        res.end("Quartzi Copilot host. Connect from the Obsidian plugin.\n");
       });
       server.on("upgrade", (req, socket) => this.upgrade(req, socket));
       await new Promise((resolve, reject) => {
@@ -1585,6 +1825,7 @@ class Host {
       this.addresses.push(h);
     }
     this.chats = new Set();
+    await this.startTranslator();
     if (!this.config.transcribeCommand) setTimeout(() => this.whisper(), 2000);
     setTimeout(() => this.ensureSpare(this.signature({})), 1000);
     this.log(`Hosting on ${this.addresses.map((h) => h + ":" + this.config.port).join(", ")} with ${this.claude}`);
@@ -1592,6 +1833,7 @@ class Host {
 
   stop() {
     this.stopped = true;
+    if (this.translator) { this.translator.close(); this.translator = null; }
     for (const c of this.chats || []) this.kill(c);
     if (this.spare) this.kill(this.spare);
     this.spare = null;
@@ -1635,14 +1877,16 @@ class Host {
           ws.send({ type: "hello", vault: nodeRequire("path").basename(this.config.vaultPath), vaultRoot: this.config.vaultPath, host: nodeRequire("os").hostname() });
           this.log("Paired device connected: " + peer);
         } else {
-          ws.send({ type: "error", code: "auth", message: "This device isn't paired. Paste the pairing code from the host computer in Vault Claude settings." });
+          ws.send({ type: "error", code: "auth", message: "This device isn't paired. Paste the pairing code from the host computer in Quartzi Copilot settings." });
           ws.close();
         }
         return;
       }
       if (msg.type === "send") {
-        if (ws.current && ws.current.turn) { ws.send({ type: "error", message: "Claude is still working on the last message." }); return; }
+        if (ws.current && ws.current.turn) { ws.send({ type: "error", message: "Copilot is still working on the last message." }); return; }
         this.runTurn(ws, msg);
+      } else if (msg.type === "models") {
+        this.listProviders().then((providers) => ws.send({ type: "models", providers }));
       } else if (msg.type === "interrupt") {
         if (ws.current && ws.current.turn) { ws.current.interrupted = true; this.kill(ws.current); }
       } else if (msg.type === "warmup") {
@@ -1691,12 +1935,79 @@ class Host {
     return saved;
   }
 
+  // ---------- other providers ----------
+  providerConfig(id) {
+    const p = PROVIDERS[id];
+    if (!p || id === "claude") return null;
+    const saved = (this.config.getKey && this.config.getKey(id)) || "";
+    const key = saved || (p.env && process.env[p.env]) || "";
+    const base = id === "custom" ? (this.config.getKey && this.config.getKey("custom-url")) || "" : p.base;
+    if (!base || (!key && !p.local && id !== "custom")) return null;
+    return { name: p.name, base: base.replace(/\/+$/, ""), key, noUsage: p.noUsage, local: p.local };
+  }
+
+  // Only providers that are set up, with the models each says it has right now.
+  async listProviders() {
+    const out = [];
+    await Promise.all(Object.keys(PROVIDERS).map(async (id, i) => {
+      const cfg = this.providerConfig(id);
+      if (!cfg) return;
+      const models = await listModels(cfg);
+      if (models.length) out[i] = { id, name: cfg.name, models };
+    }));
+    return out.filter(Boolean);
+  }
+
+  providerEnv(provider, model) {
+    return Object.assign({}, process.env, {
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${this.translatorPort}/p/${provider}`,
+      ANTHROPIC_AUTH_TOKEN: this.translatorToken,
+      ANTHROPIC_API_KEY: "",
+      ANTHROPIC_MODEL: model,
+      ANTHROPIC_SMALL_FAST_MODEL: model,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: model,
+      ENABLE_TOOL_SEARCH: "false",
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    });
+  }
+
+  async startTranslator() {
+    this.translatorToken = nodeRequire("crypto").randomBytes(24).toString("hex");
+    const memo = new Map();
+    this.translator = nodeRequire("http").createServer((req, res) => {
+      const m = /^\/p\/([\w-]+)\/v1\/messages(\/count_tokens)?/.exec(req.url);
+      const auth = String(req.headers.authorization || "").replace(/^Bearer /, "") || req.headers["x-api-key"];
+      const fail = (code, message) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify({ type: "error", error: { type: "api_error", message } })); };
+      if (!m || auth !== this.translatorToken) return fail(404, "Not found");
+      const cfg = this.providerConfig(m[1]);
+      if (!cfg) return fail(401, "That provider isn't set up.");
+      let raw = "";
+      req.setEncoding("utf8");
+      req.on("data", (d) => { raw += d; });
+      req.on("end", () => {
+        let body;
+        try { body = JSON.parse(raw); } catch (e) { return fail(400, "Bad JSON"); }
+        if (m[2]) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ input_tokens: Math.ceil(raw.length / 4) })); }
+        translateTurn(cfg, body, res, memo, fail);
+      });
+    });
+    await new Promise((resolve, reject) => {
+      this.translator.once("error", reject);
+      this.translator.listen(0, "127.0.0.1", resolve);
+    });
+    this.translatorPort = this.translator.address().port;
+  }
+
   // ---------- Claude processes ----------
   // Starting Claude Code (hooks, MCP servers) takes 10-20 s. So each chat keeps one process
   // running between messages (stream-json input), and one spare is kept warm for the next
   // new chat. Changing mode, model or effort starts a new process that resumes the same chat.
   signature(msg) {
     const mode = PERMISSION_MODES.has(msg.permissionMode) ? msg.permissionMode : "acceptEdits";
+    const provider = PROVIDERS[msg.provider] ? msg.provider : "claude";
+    if (provider !== "claude" && msg.providerModel && /^[\w.\/:@-]+$/.test(msg.providerModel)) return [mode, msg.providerModel, "medium", provider].join("|");
     const model = msg.model && /^[\w.-]+$/.test(msg.model) ? msg.model : DEFAULT_SETTINGS.model;
     const effort = EFFORT_LEVELS.has(msg.effort) ? msg.effort : DEFAULT_SETTINGS.effort;
     return [mode, model, effort].join("|");
@@ -1706,14 +2017,18 @@ class Host {
     const cp = nodeRequire("child_process");
     const path = nodeRequire("path");
     const fs = nodeRequire("fs");
-    const [mode, model, effort] = sig.split("|");
+    const [mode, model, effort, provider] = sig.split("|");
     const attachRoot = path.join(this.tmp, "attachments");
     fs.mkdirSync(attachRoot, { recursive: true });
     const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
       "--include-partial-messages", "--append-system-prompt", SYSTEM_PROMPT, "--add-dir", attachRoot,
-      "--permission-mode", mode, "--model", model, "--effort", effort];
+      "--permission-mode", mode, "--model", model];
+    // Other providers run through the local translator with Claude Code's built-in tools.
+    // MCP servers stay off there: their hundreds of tools exceed what those APIs accept.
+    if (provider) args.push("--strict-mcp-config");
+    else args.push("--effort", effort);
     if (resume) args.push("--resume", resume);
-    const proc = cp.spawn(this.claude, args, { cwd: this.config.vaultPath, env: process.env, windowsHide: true });
+    const proc = cp.spawn(this.claude, args, { cwd: this.config.vaultPath, env: provider ? this.providerEnv(provider, model) : process.env, windowsHide: true });
     const c = { proc, sig, resumed: resume, sessionId: resume, turn: null, buf: "", stderr: "", dead: false, idleTimer: null };
     this.chats.add(c);
     proc.stdout.setEncoding("utf8");
@@ -1795,6 +2110,8 @@ class Host {
   runTurn(ws, msg, saved) {
     if (!saved) saved = this.saveAttachments(msg.attachments);
     const sig = this.signature(msg);
+    const pid = sig.split("|")[3];
+    if (pid && !this.providerConfig(pid)) { ws.send({ type: "error", message: `${PROVIDERS[pid].name} isn't set up. Add its key in Quartzi Copilot settings on your computer.` }); ws.send({ type: "done" }); return null; }
     const sid = msg.sessionId && /^[\w-]+$/.test(msg.sessionId) ? msg.sessionId : null;
     let c = null;
     if (sid) {
@@ -1991,13 +2308,33 @@ class VaultClaudeSettings extends PluginSettingTab {
         .addDropdown((d) => d.addOption("beside", "Beside the note").addOption("sidebar", "In the sidebar").setValue(s.placement || "beside")
           .onChange(async (v) => { s.placement = v; await plugin.saveSettings(); plugin.app.workspace.detachLeavesOfType(VIEW_TYPE); await plugin.activate(); }));
     }
+    if (Platform.isDesktopApp && plugin.hostEnabled()) {
+      new Setting(containerEl).setName("Model providers").setHeading();
+      containerEl.createDiv({ cls: "setting-item-description vc-settings-note", text: "Claude uses your Claude login. Other providers appear in the brain menu once they have a key. Keys stay on this computer and never sync. Those chats use the built-in file and shell tools, without your MCP servers." });
+      const refresh = () => plugin.views().forEach((v) => { if (v.isReady()) v.ws.send(JSON.stringify({ type: "models" })); });
+      for (const id of Object.keys(PROVIDERS)) {
+        const p = PROVIDERS[id];
+        if (id === "claude" || p.local) continue;
+        if (id === "custom") {
+          new Setting(containerEl).setName("Custom address").setDesc("Any OpenAI-compatible API, for example https://host/v1.")
+            .addText((t) => t.setPlaceholder("https://host/v1").setValue(plugin.local("provider-custom-url") || "").onChange((v) => { plugin.local("provider-custom-url", v.trim()); refresh(); }));
+        }
+        const fromEnv = p.env && process.env[p.env];
+        new Setting(containerEl).setName(id === "custom" ? "Custom key" : p.name)
+          .addText((t) => {
+            t.inputEl.type = "password";
+            t.setPlaceholder(fromEnv ? `Using ${p.env}` : "API key").setValue(plugin.local("provider-" + id) || "").onChange((v) => { plugin.local("provider-" + id, v.trim()); refresh(); });
+          });
+      }
+      containerEl.createDiv({ cls: "setting-item-description vc-settings-note", text: "Ollama and LM Studio appear on their own while they are running on this computer." });
+    }
     new Setting(containerEl).setName(Platform.isDesktopApp ? "Connect to another computer" : "Connect to your computer").setHeading();
     if (Platform.isDesktopApp && plugin.hostEnabled()) {
       containerEl.createDiv({ cls: "setting-item-description vc-settings-note", text: "This computer runs Claude Code itself, so it doesn't use these. They are what your other devices use." });
     }
     new Setting(containerEl)
       .setName("Computer address")
-      .setDesc("Shown in Vault Claude settings on the computer running Claude Code, for example ws://100.101.102.103:8787.")
+      .setDesc("Shown in Quartzi Copilot settings on the computer running Claude Code, for example ws://100.101.102.103:8787.")
       .addText((t) => t.setPlaceholder("ws://100.x.y.z:8787").setValue(s.serverUrl).onChange(async (v) => {
         s.serverUrl = v.trim();
         await plugin.saveSettings();
@@ -2017,12 +2354,14 @@ module.exports = class VaultClaudePlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     // Older versions saved "" for Default/Auto; those choices are gone.
+    if (!this.settings.provider) this.settings.provider = "claude";
     if (!MODELS.some(([v]) => v === this.settings.model)) this.settings.model = DEFAULT_SETTINGS.model;
     if (!EFFORTS.some(([v]) => v === this.settings.effort)) this.settings.effort = DEFAULT_SETTINGS.effort;
     this.host = null;
     this.hostError = "";
     this.registerView(VIEW_TYPE, (leaf) => new VaultClaudeView(leaf, this));
-    this.addRibbonIcon("sparkles", "Open Claude", () => this.activate());
+    if (addIcon) addIcon("quartzi", QUARTZI_MARK);
+    this.addRibbonIcon("quartzi", "Open Quartzi Copilot", () => this.activate());
     this.addCommand({ id: "open", name: "Open chat", callback: () => this.activate() });
     this.addCommand({
       id: "ask-about-selection",
@@ -2083,6 +2422,7 @@ module.exports = class VaultClaudePlugin extends Plugin {
       vaultPath: typeof adapter.getBasePath === "function" ? adapter.getBasePath() : "",
       port,
       bind: s.hostBind,
+      getKey: (id) => this.local("provider-" + id) || "",
       token: s.pairingCode,
       claudePath: s.claudePath,
       transcribeCommand: s.transcribeCommand,

@@ -1,9 +1,9 @@
 {
   "id": "vault-claude",
-  "name": "Vault Claude",
-  "version": "0.7.0",
+  "name": "Quartzi Copilot",
+  "version": "0.8.0",
   "minAppVersion": "1.5.0",
-  "description": "A chat sidebar for Claude Code on your own computer and Claude subscription. Use it from your iPad or phone over Tailscale.",
-  "author": "Jake",
+  "description": "A chat pane for your vault, powered by Claude Code on your own computer, with Claude and other model providers. Use it from your iPad or phone over Tailscale.",
+  "author": "Quartzi",
   "isDesktopOnly": false
 }

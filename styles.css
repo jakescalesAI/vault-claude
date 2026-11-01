@@ -414,9 +414,9 @@ body.theme-dark .vc-root {
 .vc-send.is-stop { background: var(--vc-text) !important; color: var(--vc-bg) !important; }
 
 /* Row under the field: + | open note | mic | brain */
-.vc-controls { display: flex; align-items: center; margin: 2px -6px 0; }
-.vc-controls .vc-icon-btn { min-width: 40px; }
-.vc-context { flex: 1; min-width: 0; display: flex; }
+.vc-controls { display: flex; align-items: center; gap: 4px; margin: 2px -6px 0; container-type: inline-size; }
+.vc-controls .vc-icon-btn { flex: none; width: 36px; min-width: 36px; }
+.vc-context { flex: 0 1 auto; min-width: 0; display: flex; margin-right: auto; }
 .vc-chip {
   display: inline-flex !important;
   align-items: center;
@@ -474,7 +474,7 @@ body.theme-dark .vc-root {
   transform-origin: bottom right;
   animation: vc-pop 0.25s var(--vc-ease);
 }
-.vc-menu-settings { width: 290px; max-width: calc(100% - 16px); padding: 4px 12px 14px; }
+.vc-menu-settings { width: 290px; max-width: calc(100% - 16px); box-sizing: border-box; max-height: 70vh; overflow-y: auto; padding: 4px 12px 14px; }
 .vc-menu-section { padding: 12px 4px 6px; font-size: 13px; text-transform: uppercase; letter-spacing: 0; color: var(--vc-text-2); }
 
 /* ---------- open-notes dropdown (from the note pill) ---------- */
@@ -522,9 +522,9 @@ body.theme-dark .vc-root {
 .vc-ring-track { stroke: var(--vc-fill); }
 .vc-ring-fill { stroke: var(--vc-blue); stroke-linecap: round; transition: stroke-dashoffset 0.35s var(--vc-ease); }
 .vc-usage.is-high .vc-ring-fill { stroke: var(--vc-orange, #ff9500); }
-.vc-menu-usage { width: 300px; max-width: calc(100% - 16px); padding: 12px 14px 4px; }
+.vc-menu-usage { width: 300px; max-width: calc(100% - 16px); box-sizing: border-box; padding: 12px 14px 4px; }
 .vc-usage-row { margin-bottom: 12px; }
-.vc-usage-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 6px; font-size: 13px; }
+.vc-usage-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 8px; margin-bottom: 6px; font-size: 13px; }
 .vc-usage-label { color: var(--vc-text); }
 .vc-usage-sub { color: var(--vc-text-2); }
 .vc-usage-value { font-weight: 600; white-space: nowrap; }
@@ -731,3 +731,9 @@ body.theme-dark .vc-root {
 /* Keyboard up: the safe-area gap belongs to the keyboard now. */
 .vc-root.vc-keyboard .vc-composer { padding-bottom: 4px; }
 .vc-alert-msg { white-space: pre-line; }
+
+/* Narrow pane: the note name matters more than its state. */
+@container (max-width: 300px) { .vc-chip-note { display: none; } }
+.vc-select { width: 100%; }
+.vc-empty-mark { width: 44px; height: 44px; }
+.vc-empty-mark svg { width: 100%; height: 100%; }
