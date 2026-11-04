@@ -58,7 +58,7 @@
   class PluginSettingTab { constructor(a, p) { this.app = a; this.plugin = p; this.containerEl = make("div"); } }
   class TFile {}
   const notes = new Map();
-  const workspace = { on: () => ({}), getActiveFile: () => null, iterateAllLeaves() {}, getActiveViewOfType: () => null, onLayoutReady: (f) => f(), getLeavesOfType: () => [], revealLeaf() {}, rootSplit: {}, openLinkText() {} };
+  const workspace = { on: () => ({}), active: null, open: [], getActiveFile() { return this.active; }, iterateAllLeaves(fn) { this.open.forEach((file) => fn({ view: { file } })); }, getActiveViewOfType() { return this.active ? { editor: { getSelection: () => "BANKTEXT" } } : null; }, onLayoutReady: (f) => f(), getLeavesOfType: () => [], revealLeaf() {}, rootSplit: {}, openLinkText() {} };
   const app = {
     workspace, loadLocalStorage: () => null, saveLocalStorage() {},
     vault: { getName: () => "test", getAbstractFileByPath: (p) => notes.get(p) || null, createFolder: async (p) => { notes.set(p, {}); }, create: async (p, t) => { const f = new TFile(); f.text = t; notes.set(p, f); return f; }, process: async (f, fn) => { f.text = fn(f.text); }, adapter: {} },
@@ -144,6 +144,20 @@
     const text = plugin.tab.containerEl.textContent;
     check("phone settings show set and not set", /DeepSeek/.test(text) && /Not set/.test(text), text.slice(0, 200));
     check("phone settings have no key box", !plugin.tab.containerEl.querySelector("input[type=password]"));
+
+    const money = { path: "10 Money/Bank/a.md", basename: "a" }, other = { path: "ok.md", basename: "ok" };
+    workspace.active = money;
+    workspace.open = [money, other];
+    const ctx = view.currentContext();
+    check("an active 10 Money note stays out of the context", !JSON.stringify(ctx).includes("10 Money") && !ctx.activeFile, JSON.stringify(ctx));
+    check("its selected text stays out too", !JSON.stringify(ctx).includes("BANKTEXT"), JSON.stringify(ctx));
+    check("other open notes still go", (ctx.openFiles || []).includes("ok.md"), JSON.stringify(ctx));
+    check("the note picker doesn't offer it", !view.openNotes().some((f) => f.path === money.path));
+    workspace.active = other;
+    workspace.open = [other, money];
+    check("an open 10 Money tab stays out", !JSON.stringify(view.currentContext()).includes("10 Money"), JSON.stringify(view.currentContext()));
+    workspace.active = null;
+    workspace.open = [];
 
     const shown = () => { const a = document.querySelector(".vc-alert"); return a ? a.textContent : ""; };
     const dismiss = () => { document.querySelectorAll(".vc-alert, .vc-alert-scrim").forEach((e) => e.remove()); };

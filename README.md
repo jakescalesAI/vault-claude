@@ -56,6 +56,7 @@ Keep Obsidian open on the computer, and keep the computer awake, while you use i
 - By default the host only listens on `127.0.0.1` and, when enabled, your Tailscale address. Every connection must send the pairing code within five seconds, or it is closed.
 - **Any network** listens on every interface. Only use it on a network you trust, and prefer Tailscale.
 - Tapping **New code** in settings signs out every paired device.
+- `10 Money` stays out of every chat, on every provider and in every mode: Claude Code starts with deny rules for its file tools, and open notes there are left out of what a message sends. One gap remains: a shell search from the vault root, such as `grep -r`, can still reach the folder. The model is told to leave it out, which is an instruction, not a block.
 - The connection is plain `ws://`. Tailscale encrypts traffic between your devices. Don't expose the port to the internet.
 
 ## Troubleshooting

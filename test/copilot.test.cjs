@@ -16,7 +16,7 @@ class Stub {}
 class TFile {}
 const platform = { isDesktopApp: true };
 const obsidian = { Plugin: class { constructor() { this.app = {}; } }, ItemView: Stub, PluginSettingTab: Stub, Setting: Stub, MarkdownRenderer: Stub, MarkdownView: Stub, Notice: Stub, Platform: platform, TFile, normalizePath: (p) => p, requestUrl: async () => ({ text: "" }) };
-const exportsList = "Host, PROVIDERS, diagnose, probeFailure, versionsText, logProblem, logLine, endpointProblem, TOOLS_REFUSED, hideKey, toOpenAI, DEFAULT_SETTINGS";
+const exportsList = "Host, PROVIDERS, isPrivate, PRIVATE_DENY, diagnose, probeFailure, versionsText, logProblem, logLine, endpointProblem, TOOLS_REFUSED, hideKey, toOpenAI, DEFAULT_SETTINGS";
 const mod = { exports: {} };
 let electron = null;
 new Function("require", "module", `${src}\n;module.exports.__t = { ${exportsList} };`)((n) => (n === "obsidian" ? obsidian : n === "electron" ? electron || (() => { throw new Error("no electron"); })() : require(n)), mod);
@@ -214,6 +214,24 @@ const resultOf = (msgs) => { const r = msgs.find((m) => m.type === "event" && m.
   await turn(c, { provider: "claude", model: "sonnet", effort: "low" });
   run = seen().at(-1);
   check("Claude login chats get no provider key", !run.env.OPENAI_API_KEY && !run.env.MISTRAL_API_KEY && !run.env.MY_SERVER_KEY, Object.keys(run.env));
+
+  // ---------- 10 Money ----------
+  const denied = (a) => { const i = a.indexOf("--settings"); return i >= 0 ? JSON.parse(a[i + 1]).permissions.deny : []; };
+  const covers = (a) => ["Read(./10 Money/**)", "Edit(./10 Money/**)", "Bash(*10 Money*)"].every((rule) => denied(a).includes(rule));
+  check("a Claude login chat starts with the deny rules", covers(run.args), run.args);
+  await turn(c, { provider: "anthropic", providerModel: "claude-test", effort: "high" });
+  check("an Anthropic API chat starts with them", covers(seen().at(-1).args));
+  await turn(c, { provider: "openai", providerModel: "good-model" });
+  check("a translated chat starts with them", covers(seen().at(-1).args));
+  await turn(c, { provider: "openai", providerModel: "good-model", permissionMode: "auto" });
+  check("so does every mode", covers(seen().at(-1).args));
+  check("every chat is told to stay out", seen().every((r) => r.args.some((a) => a.includes("Never read, search, list or edit the 10 Money folder"))));
+  for (const p of ["10 Money/a.md", "10 Money/Bank/a.md", "10 money/a.md", "x/10 MONEY/a.md", "10 Money\\Bank\\a.md"]) check(`private: ${p}`, T.isPrivate(p));
+  for (const p of ["", "note.md", "10 Moneyball/a.md", "Money/a.md", "110 Money/a.md", "10 Money.md"]) check(`not private: ${p || "(empty)"}`, !T.isPrivate(p));
+  const told = host.buildPrompt({ text: "hi", context: { activeFile: "10 Money/Bank/a.md", openFiles: ["10 Money/b.md", "ok.md"], selection: "BANKTEXT" } }, []);
+  check("the host drops 10 Money from the context", !/10 Money|BANKTEXT/.test(told) && /ok\.md/.test(told), told);
+  const plain = host.buildPrompt({ text: "hi", context: { activeFile: "ok.md", selection: "words" } }, []);
+  check("other notes keep their context", /ok\.md/.test(plain) && /words/.test(plain), plain);
 
   const raw = await new Promise((r) => http.get(`http://127.0.0.1:${PORT}/status`, (res) => { let t = ""; res.on("data", (d) => { t += d; }); res.on("end", () => r(t)); }));
   const st = JSON.parse(raw);

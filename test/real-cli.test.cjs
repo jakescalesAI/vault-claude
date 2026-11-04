@@ -34,8 +34,13 @@ function client(port) {
   const vault = path.join(tmp, "vault"), config = path.join(tmp, "config");
   fs.mkdirSync(vault);
   fs.mkdirSync(config);
+  // Someone who has allowed a shell command in their settings still can't aim it at 10 Money.
+  fs.writeFileSync(path.join(config, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(python3 *)"] } }));
   const note = path.join(vault, "note.md");
   fs.writeFileSync(note, "the secret word is marigold\n");
+  const money = path.join(vault, "10 Money", "Bank", "statement.md");
+  fs.mkdirSync(path.dirname(money), { recursive: true });
+  fs.writeFileSync(money, "BANKSECRET balance\n");
   Object.assign(process.env, { CLAUDE_CONFIG_DIR: config, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_TELEMETRY: "1", DISABLE_AUTOUPDATER: "1" });
   for (const k of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"]) delete process.env[k];
 
@@ -67,6 +72,32 @@ function client(port) {
   let msgs = await turn({ provider: "openai", providerModel: "good-model", text: "What is the secret word in note.md?" });
   check("real Claude Code finishes a chat through the translator", /marigold/.test(result(msgs).result || ""), result(msgs));
   check("the tool step ran for real", toolSteps(msgs).some((b) => b.name === "Read"), msgs.map((m) => m.type));
+
+  // 10 Money: real tool calls from the model, refused by the deny rules in every mode.
+  const refusedBy = (msgs) => /denied/i.test(result(msgs).result || "") && !/BANKSECRET/.test(JSON.stringify(msgs));
+  for (const permissionMode of ["acceptEdits", "default", "plan", "auto"]) {
+    stub.plan = ["Read", { file_path: money }];
+    msgs = await turn({ provider: "openai", providerModel: "good-model", permissionMode, text: "read it" });
+    check(`Read of a 10 Money note is refused in ${permissionMode}`, refusedBy(msgs), result(msgs).result);
+  }
+  const moneyTools = [
+    ["a relative Read", "Read", { file_path: "10 Money/Bank/statement.md" }],
+    ["a path through ..", "Read", { file_path: path.join(vault, "x", "..", "10 Money", "Bank", "statement.md") }],
+    ["Bash cat", "Bash", { command: "cat '10 Money/Bank/statement.md'" }],
+    ["an allowed shell command", "Bash", { command: "python3 -c \"print(open('10 Money/Bank/statement.md').read())\"" }],
+    ["Edit", "Edit", { file_path: money, old_string: "balance", new_string: "changed" }],
+    ["Write", "Write", { file_path: path.join(vault, "10 Money", "new.md"), content: "x" }],
+  ];
+  for (const [name, tool, input] of moneyTools) {
+    stub.plan = [tool, input];
+    msgs = await turn({ provider: "openai", providerModel: "good-model", text: "go" });
+    check(`${name} into 10 Money is refused`, refusedBy(msgs), result(msgs).result);
+  }
+  check("nothing in 10 Money changed", fs.readFileSync(money, "utf8") === "BANKSECRET balance\n" && !fs.existsSync(path.join(vault, "10 Money", "new.md")));
+  check("no 10 Money text reached the provider", !JSON.stringify(stub.calls).includes("BANKSECRET"));
+  stub.plan = ["Read", { file_path: note }];
+  msgs = await turn({ provider: "openai", providerModel: "good-model", text: "read it" });
+  check("other notes still read after that", /marigold/.test(result(msgs).result || ""), result(msgs).result);
 
   msgs = await turn({ provider: "openai", providerModel: "no-tools", text: "hello" });
   check("a model with no tools still answers through the real CLI", result(msgs).result === "hello from no-tools", result(msgs));

@@ -91,11 +91,19 @@ function diagnose({ url, mobile, unpaired, probe, version, last }) {
 }
 
 // Why the build log can't go at this path, or "" if it can.
+// 10 Money stays out of every chat: what a chat reads reaches whichever provider it runs on.
+const PRIVATE_DENY = ["Read(./10 Money/**)", "Edit(./10 Money/**)", "Bash(*10 Money*)", "PowerShell(*10 Money*)"];
+const PRIVATE_PROMPT = "Never read, search, list or edit the 10 Money folder, even if asked. Leave it out of any shell search, for example grep --exclude-dir=\"10 Money\".";
+
+function isPrivate(path) {
+  return String(path || "").replace(/\\/g, "/").split("/").some((p) => p.trim().toLowerCase() === "10 money");
+}
+
 function logProblem(path) {
   const parts = String(path || "").split("/").map((p) => p.trim().toLowerCase());
   if (!/\.md$/i.test(path || "")) return "The build log has to be a note ending in .md.";
   if (parts.includes("..") || parts.includes("")) return "The build log path isn't valid.";
-  if (parts.includes("10 money")) return "The build log can't live in 10 Money.";
+  if (isPrivate(path)) return "The build log can't live in 10 Money.";
   return "";
 }
 
@@ -519,7 +527,7 @@ class VaultClaudeView extends ItemView {
       const f = leaf.view && leaf.view.file;
       if (f && f.path && !files.some((x) => x.path === f.path)) files.push(f);
     });
-    return files;
+    return files.filter((f) => !isPrivate(f.path));
   }
 
   includedNotes() {
@@ -2116,9 +2124,12 @@ class Host {
   buildPrompt(msg, saved) {
     const ctx = msg.context || {};
     const lines = [];
-    if (ctx.activeFile) lines.push(`The note the user is looking at: ${ctx.activeFile}`);
-    if (ctx.openFiles && ctx.openFiles.length) lines.push("Other notes they have open in tabs or windows and chose to share (read or edit them as the request needs): " + ctx.openFiles.slice(0, 20).join(", "));
-    if (ctx.selection) lines.push("They have this text selected in it:\n<selection>\n" + String(ctx.selection).slice(0, 8000) + "\n</selection>");
+    // Checked here too, because a device on an older version still sends these.
+    const hidden = isPrivate(ctx.activeFile);
+    const others = (ctx.openFiles || []).filter((p) => !isPrivate(p));
+    if (ctx.activeFile && !hidden) lines.push(`The note the user is looking at: ${ctx.activeFile}`);
+    if (others.length) lines.push("Other notes they have open in tabs or windows and chose to share (read or edit them as the request needs): " + others.slice(0, 20).join(", "));
+    if (ctx.selection && !hidden) lines.push("They have this text selected in it:\n<selection>\n" + String(ctx.selection).slice(0, 8000) + "\n</selection>");
     let prompt = String(msg.text || "");
     if (lines.length) prompt = "<obsidian-context>\n" + lines.join("\n") + "\n</obsidian-context>\n\n" + prompt;
     if (saved.length) {
@@ -2291,7 +2302,8 @@ class Host {
 
   systemPrompt() {
     const log = this.config.logPath;
-    return log ? `${SYSTEM_PROMPT}\nWhen the user asks you to log a build or a publish, add one plain bullet (never a checkbox) with the date to the note ${log}.` : SYSTEM_PROMPT;
+    const base = `${SYSTEM_PROMPT}\n${PRIVATE_PROMPT}`;
+    return log ? `${base}\nWhen the user asks you to log a build or a publish, add one plain bullet (never a checkbox) with the date to the note ${log}.` : base;
   }
 
   spawnClaude(sig, resume) {
@@ -2303,7 +2315,7 @@ class Host {
     fs.mkdirSync(attachRoot, { recursive: true });
     const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
       "--include-partial-messages", "--append-system-prompt", this.systemPrompt(), "--add-dir", attachRoot,
-      "--permission-mode", mode, "--model", model];
+      "--permission-mode", mode, "--model", model, "--settings", JSON.stringify({ permissions: { deny: PRIVATE_DENY } })];
     // Other providers run through the local translator with Claude Code's built-in tools.
     // MCP servers stay off there: their hundreds of tools exceed what those APIs accept.
     const translated = provider && this.providerDef(provider).kind !== "anthropic";
