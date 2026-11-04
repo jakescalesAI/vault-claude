@@ -231,12 +231,13 @@ const resultOf = (msgs) => { const r = msgs.find((m) => m.type === "event" && m.
   for (const p of ["", "note.md", "10 Moneyball/a.md", "Money/a.md", "110 Money/a.md", "10 Money.md"]) check(`not private: ${p || "(empty)"}`, !T.isPrivate(p));
   const told = host.buildPrompt({ text: "hi", context: { activeFile: "10 Money/Bank/a.md", openFiles: ["10 Money/b.md", "ok.md"], selection: "BANKTEXT" } }, []);
   check("the host drops 10 Money from the context", !/10 Money|BANKTEXT/.test(told) && /ok\.md/.test(told), told);
+  fs.writeFileSync(path.join(tmp, "ok.md"), "note\n");
   const plain = host.buildPrompt({ text: "hi", context: { activeFile: "ok.md", selection: "words" } }, []);
   check("other notes keep their context", /ok\.md/.test(plain) && /words/.test(plain), plain);
 
   // ---------- shell on outside providers ----------
   T.PROVIDERS.lmstudio.base = stub.base;
-  const shellOff = (a) => ["Bash", "PowerShell", "Read(./.trash/**)", "Edit(./.trash/**)", "Read(./.git/**)", "Read(./.obsidian/**)", "Edit(./.obsidian/**)"].every((rule) => denied(a).includes(rule));
+  const shellOff = (a) => ["Bash", "PowerShell", "Read(./.trash/**)", "Edit(./.trash/**)", "Read(./.git/**)", "Read(./.obsidian*/**)", "Edit(./.obsidian*/**)"].every((rule) => denied(a).includes(rule));
   const shellFor = async (msg) => { const m = await turn(c, msg); const a = seen().at(-1).args; return { off: shellOff(a), told: m.some((x) => x.type === "warning" && /Shell commands are off/.test(x.message)), asked: a.some((x) => x.includes("Shell commands are off in this chat")), msgs: m }; };
   for (const [name, msg] of [["OpenAI", { provider: "openai", providerModel: "good-model" }], ["Mistral", { provider: "mistral", providerModel: "good-model" }], ["a custom endpoint at localhost", { provider: "custom-a", providerModel: "typed-model" }]]) {
     const r = await shellFor(msg);
@@ -267,8 +268,9 @@ const resultOf = (msgs) => { const r = msgs.find((m) => m.type === "event" && m.
   // ---------- selection ----------
   const promptOf = (ctx) => host.buildPrompt({ text: "hi", context: ctx }, []);
   check("a selection with no note is dropped", !promptOf({ selection: "STRAY" }).includes("STRAY"));
+  fs.writeFileSync(path.join(tmp, "a.md"), "note\n");
   check("a selection in a normal note stays", promptOf({ activeFile: "a.md", selection: "PLAIN" }).includes("PLAIN"));
-  check("a selection in a note that doesn't exist yet stays", promptOf({ activeFile: "not-synced.md", selection: "PLAIN" }).includes("PLAIN"));
+  check("a selection in a note that isn't there is dropped", !promptOf({ activeFile: "not-synced.md", selection: "PLAIN" }).includes("PLAIN"));
   const vault = tmp;
   fs.mkdirSync(path.join(vault, "10 Money"), { recursive: true });
   fs.writeFileSync(path.join(vault, "10 Money", "real.md"), "x");

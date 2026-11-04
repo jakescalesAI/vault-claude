@@ -96,7 +96,16 @@ const PRIVATE_DENY = ["Read(./10 Money/**)", "Edit(./10 Money/**)", "Bash(*10 Mo
 // Chats that leave this computer get no shell, because a plain grep -r would carry 10 Money with it,
 // no Obsidian trash or git history, because both can hold copies from there, and no .obsidian,
 // because plugin data holds pairing codes and sync logins, and plugin code runs when edited.
-const OUTSIDE_DENY = ["Bash", "PowerShell", "Monitor", ...[".trash", ".git", ".obsidian"].flatMap((d) => [`Read(./${d}/**)`, `Edit(./${d}/**)`])];
+function outsideDeny(configDir, tmp, claudeConfig) {
+  const folders = [".trash", ".git", ".obsidian*"].concat(configDir ? [configDir] : []);
+  return ["Bash", "PowerShell", "Monitor", ...folders.flatMap((d) => [`Read(./${d}/**)`, `Edit(./${d}/**)`]),
+    // Attachments from every other kind of chat live here.
+    `Read(${absoluteRule(tmp)}/**)`, `Edit(${absoluteRule(tmp)}/**)`,
+    // Claude Code lets a chat write its memory folder without asking, even with memory off.
+    `Edit(${absoluteRule(claudeConfig)}/projects/*/memory/**)`];
+}
+// An absolute path in a permission rule starts with two slashes, and a Windows drive loses its colon.
+function absoluteRule(p) { return "/" + String(p).replace(/\\/g, "/").replace(/^([A-Za-z]):/, "/$1"); }
 const NO_SHELL_PROMPT = "Shell commands are off in this chat. If a task needs one, say so plainly.";
 const PRIVATE_PROMPT = "Never read, search, list or edit the 10 Money folder, even if asked. Leave it out of any shell search, for example grep --exclude-dir=\"10 Money\".";
 
@@ -1970,6 +1979,7 @@ class Host {
     if (!this.claude) throw new Error("Claude Code wasn't found on this computer. Install it from claude.com/claude-code, or set its path in settings.");
     this.tmp = path.join(os.tmpdir(), "vault-claude");
     fs.mkdirSync(this.tmp, { recursive: true });
+    this.sweepAttachments();
 
     const hosts = [];
     if (this.config.bind === "all") hosts.push("0.0.0.0");
@@ -2127,6 +2137,10 @@ class Host {
   }
 
   // A link can lead into the private folder, so where the note really is decides.
+  noteExists(file) {
+    return nodeRequire("fs").existsSync(nodeRequire("path").resolve(this.config.vaultPath, file));
+  }
+
   privateNote(file) {
     if (isPrivate(file)) return true;
     if (!file) return false;
@@ -2148,7 +2162,7 @@ class Host {
     const others = (ctx.openFiles || []).filter((p) => !this.privateNote(p));
     if (ctx.activeFile && !hidden) lines.push(`The note the user is looking at: ${ctx.activeFile}`);
     if (others.length) lines.push("Other notes they have open in tabs or windows and chose to share (read or edit them as the request needs): " + others.slice(0, 20).join(", "));
-    if (ctx.selection && ctx.activeFile && !hidden) lines.push("They have this text selected in it:\n<selection>\n" + String(ctx.selection).slice(0, 8000) + "\n</selection>");
+    if (ctx.selection && ctx.activeFile && !hidden && this.noteExists(ctx.activeFile)) lines.push("They have this text selected in it:\n<selection>\n" + String(ctx.selection).slice(0, 8000) + "\n</selection>");
     let prompt = String(msg.text || "");
     if (lines.length) prompt = "<obsidian-context>\n" + lines.join("\n") + "\n</obsidian-context>\n\n" + prompt;
     if (saved.length) {
@@ -2158,12 +2172,31 @@ class Host {
     return prompt;
   }
 
-  saveAttachments(items) {
+  attachRoot(outside) {
+    const path = nodeRequire("path");
+    return outside ? this.tmp + "-outside" : path.join(this.tmp, "attachments");
+  }
+
+  // A crash leaves folders behind. Another vault's host can share these, so only old ones go.
+  sweepAttachments() {
+    const fs = nodeRequire("fs");
+    const path = nodeRequire("path");
+    for (const root of [this.attachRoot(false), this.attachRoot(true)]) {
+      let names = [];
+      try { names = fs.readdirSync(root); } catch (e) { continue; }
+      for (const name of names) {
+        const p = path.join(root, name);
+        try { if (Date.now() - fs.statSync(p).mtimeMs > 24 * 3600 * 1000) fs.rmSync(p, { recursive: true, force: true }); } catch (e) { /* in use */ }
+      }
+    }
+  }
+
+  saveAttachments(items, chatDir) {
     if (!items || !items.length) return [];
     const fs = nodeRequire("fs");
     const path = nodeRequire("path");
     const crypto = nodeRequire("crypto");
-    const dir = path.join(this.tmp, "attachments", crypto.randomBytes(6).toString("hex"));
+    const dir = path.join(chatDir, crypto.randomBytes(6).toString("hex"));
     fs.mkdirSync(dir, { recursive: true });
     const saved = [];
     items.slice(0, 20).forEach((a, i) => {
@@ -2354,12 +2387,17 @@ class Host {
     const path = nodeRequire("path");
     const fs = nodeRequire("fs");
     const [mode, model, effort, provider] = sig.split("|");
-    const attachRoot = path.join(this.tmp, "attachments");
-    fs.mkdirSync(attachRoot, { recursive: true });
     const outside = this.offComputer(provider);
-    const settings = outside ? { permissions: { deny: PRIVATE_DENY.concat(OUTSIDE_DENY) }, disableAllHooks: true } : { permissions: { deny: PRIVATE_DENY } };
+    // Each chat reads only its own attachments, and they go when it ends. Outside chats keep theirs
+    // apart from the rest, so the others can be denied whatever the permission mode.
+    const attachDir = path.join(this.attachRoot(outside), nodeRequire("crypto").randomBytes(6).toString("hex"));
+    fs.mkdirSync(attachDir, { recursive: true, mode: 0o700 });
+    // Git instructions would put file names and commit messages from the vault's repo in the first request.
+    const settings = outside
+      ? { permissions: { deny: PRIVATE_DENY.concat(outsideDeny(this.config.configDir, this.tmp, this.outsideConfig())) }, disableAllHooks: true, includeGitInstructions: false }
+      : { permissions: { deny: PRIVATE_DENY } };
     const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-      "--include-partial-messages", "--append-system-prompt", this.systemPrompt(outside), "--add-dir", attachRoot,
+      "--include-partial-messages", "--append-system-prompt", this.systemPrompt(outside), "--add-dir", attachDir,
       "--permission-mode", mode, "--model", model, "--settings", JSON.stringify(settings)];
     if (outside) args.push("--setting-sources", "user");
     // Other providers run through the local translator with Claude Code's built-in tools.
@@ -2369,7 +2407,7 @@ class Host {
     else args.push("--effort", effort);
     if (resume) args.push("--resume", resume);
     const proc = cp.spawn(this.claude, args, { cwd: this.config.vaultPath, env: provider ? this.providerEnv(provider, model) : this.childEnv(), windowsHide: true });
-    const c = { proc, sig, resumed: resume, sessionId: resume, turn: null, buf: "", stderr: "", dead: false, idleTimer: null };
+    const c = { proc, sig, attachDir, resumed: resume, sessionId: resume, turn: null, buf: "", stderr: "", dead: false, idleTimer: null };
     this.chats.add(c);
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (chunk) => {
@@ -2401,6 +2439,7 @@ class Host {
     const ended = (code, startError) => {
       if (c.dead) return;
       c.dead = true;
+      this.clearAttachments(c);
       clearTimeout(c.idleTimer);
       this.chats.delete(c);
       if (this.spare === c) this.spare = null;
@@ -2412,7 +2451,7 @@ class Host {
       if (c.resumed && !t.events && (c.resumeFailed || /No conversation found/i.test(c.stderr))) {
         const [, , , pid] = sig.split("|");
         t.ws.send({ type: "notice", message: this.offComputer(pid) ? `Started a new conversation. The earlier messages in this chat weren't sent to ${this.providerDef(pid).name}.` : "Started a new conversation. The earlier one can't continue here." });
-        this.runTurn(t.ws, Object.assign({}, t.msg, { sessionId: null }), t.saved);
+        this.runTurn(t.ws, Object.assign({}, t.msg, { sessionId: null }));
         return;
       }
       const err = startError || c.stderr.replace(/\S+ hook \[[\s\S]*?\] failed: Hook cancelled\s*/g, "").trim();
@@ -2450,6 +2489,12 @@ class Host {
     if (!c || c.dead) return;
     try { c.proc.stdin.end(); } catch (e) { /* closed */ }
     try { c.proc.kill(); } catch (e) { /* gone */ }
+    // Obsidian can quit before the process closes.
+    this.clearAttachments(c);
+  }
+
+  clearAttachments(c) {
+    try { nodeRequire("fs").rmSync(c.attachDir, { recursive: true, force: true }); } catch (e) { /* still open: goes when the chat closes */ }
   }
 
   ensureSpare(sig) {
@@ -2463,8 +2508,7 @@ class Host {
   }
 
   // Returns the chat process now running this turn.
-  runTurn(ws, msg, saved) {
-    if (!saved) saved = this.saveAttachments(msg.attachments);
+  runTurn(ws, msg) {
     const sig = this.signature(msg);
     const [, sigModel, , pid] = sig.split("|");
     const refuse = (message) => { ws.send({ type: "error", message }); ws.send({ type: "done" }); return null; };
@@ -2482,13 +2526,13 @@ class Host {
     if (!c) c = this.spawnClaude(sig, sid);
     clearTimeout(c.idleTimer);
     c.interrupted = false;
-    c.turn = { ws, msg, saved, events: 0 };
+    c.turn = { ws, msg, events: 0 };
     ws.current = c;
     if (this.offComputer(pid) && !c.warnedShell) {
       c.warnedShell = true;
       ws.send({ type: "warning", message: `Shell commands are off for ${this.providerDef(pid).name}, because this chat leaves your computer. It can still read and edit your notes.` });
     }
-    c.proc.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: this.buildPrompt(msg, saved) } }) + "\n");
+    c.proc.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: this.buildPrompt(msg, this.saveAttachments(msg.attachments, c.attachDir)) } }) + "\n");
     // Have the next new chat's process ready by the time it's wanted.
     setTimeout(() => this.ensureSpare(sig), 4000);
     return c;
@@ -2929,6 +2973,7 @@ module.exports = class VaultClaudePlugin extends Plugin {
     const port = Number(s.hostPort) || 8787;
     const host = new Host({
       vaultPath: typeof adapter.getBasePath === "function" ? adapter.getBasePath() : "",
+      configDir: this.app.vault.configDir,
       port,
       bind: s.hostBind,
       getKey: (id) => this.getKey(id),

@@ -47,7 +47,8 @@ function client(port) {
   write("0 Home/10 MONEY/upper.md", "NESTSECRET b\n");
   write(".trash/old.md", "TRASHSECRET old statement\n");
   const git = (args) => cp.execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd: vault }).toString().trim();
-  git(["init", "-q"]); git(["add", "-A"]); git(["commit", "-qm", "x"]);
+  git(["init", "-q"]); git(["add", "-A"]); git(["commit", "-qm", "GITLOGMARKER x"]);
+  write("10 Money/Bank/gitstatusmarker.md", "new\n");
   const blob = git(["rev-parse", "HEAD:10 Money/Bank/statement.md"]);
 
   // The user's Claude Code setup: planted, or this machine's own.
@@ -97,7 +98,7 @@ function client(port) {
   process.env.XAI_API_KEY = "fake-xai-key-0000000000";
 
   const PORT = rootConfig ? 18793 : 18792;
-  const host = new Host({ vaultPath: vault, port: PORT, bind: "local", token: "T", claudePath: process.env.CLAUDE_PATH || "claude", transcribeCommand: "x", version: "0.9.0", logPath: "Build log.md", log() {} });
+  const host = new Host({ vaultPath: vault, port: PORT, bind: "local", token: "T", claudePath: process.env.CLAUDE_PATH || "claude", transcribeCommand: "x", version: "0.9.0", logPath: "Build log.md", configDir: ".my-config", log() {} });
   await host.start();
   const c = await client(PORT);
   await c.until((m) => m.type === "status", 20000);
@@ -120,6 +121,7 @@ function client(port) {
   check("the chat runs", /hello from good-model/.test(said(msgs)), msgs.map((m) => m.type));
   check("no MCP tools, AgentHub included", !tools.some((n) => n.startsWith("mcp__")), tools);
   check("no shell tools", !tools.some((n) => /^(Bash|PowerShell|Monitor)$/.test(n)), tools);
+  check("git status and commit messages stay out of the first request", !reached(/gitstatusmarker|GITLOGMARKER/));
   check("the user's config has text to find", marks.length >= (rootConfig ? 1 : 3), marks);
   for (const m of marks) check(`user config stays out: ${m.slice(0, 40)}`, !has(m));
   if (extraFile) {
@@ -253,6 +255,114 @@ function client(port) {
   check("no plugin data reached the provider", !reached(/FAKEPAIRING/));
   check("plugin code is unchanged", fs.readFileSync(path.join(vault, ".obsidian/plugins/other/main.js"), "utf8") === "// plugin code\n");
 
+  // ---------- a renamed config folder ----------
+  fresh();
+  for (const dir of [".my-config", ".obsidian-mobile"]) {
+    write(`${dir}/plugins/vault-claude/data.json`, '{"token":"FAKEPAIRING"}');
+    write(`${dir}/plugins/other/main.js`, "// plugin code\n");
+    for (const [name, tool, input, answer] of [
+      [`Read of ${dir}`, "Read", { file_path: `${dir}/plugins/vault-claude/data.json` }, /denied/],
+      [`Grep of ${dir}`, "Grep", { pattern: "PAIRING", path: dir, output_mode: "content" }, /denied/],
+      [`Edit of ${dir}`, "Edit", { file_path: `${dir}/plugins/other/main.js`, old_string: "plugin", new_string: "changed" }, /denied/],
+    ]) {
+      stub.plan = [tool, input];
+      msgs = await turn({});
+      check(name, answer.test(said(msgs)), said(msgs));
+    }
+    check(`${dir} is unchanged`, fs.readFileSync(path.join(vault, dir, "plugins/other/main.js"), "utf8") === "// plugin code\n");
+  }
+  check("no renamed folder's plugin data reached the provider", !reached(/FAKEPAIRING/));
+
+  // ---------- the memory folder ----------
+  // A chat can write here without being asked, unless a rule stops it.
+  const projects = path.join(host.outsideConfig(), "projects");
+  const memory = path.join(projects, fs.readdirSync(projects)[0], "memory");
+  for (const mode of ["acceptEdits", "default"]) {
+    stub.plan = ["Write", { file_path: path.join(memory, `${mode}.md`), content: "MEMORYMARKER" }];
+    msgs = await turn({ permissionMode: mode });
+    check(`a chat in ${mode} can't write to its memory folder`, /denied/.test(said(msgs)) && !fs.existsSync(path.join(memory, `${mode}.md`)), said(msgs));
+  }
+
+  // ---------- attachments ----------
+  const attach = (name, text) => ({ name, mime: "text/plain", data: Buffer.from(text).toString("base64") });
+  const attachedPath = (calls) => { const m = JSON.stringify(calls.at(-1)).match(/- (\S+?attach\S*?) \(text\/plain\)/i) || JSON.stringify(calls.at(-1)).match(/- (\S+?vault-claude\S+?) \(text\/plain\)/); return m && m[1]; };
+  const chatOf = (sid) => [...host.chats].find((x) => x.sessionId === sid);
+  const gone = async (c2) => { host.kill(c2); for (let i = 0; i < 100 && !c2.dead; i++) await new Promise((r) => setTimeout(r, 50)); };
+  const senders = [["Ollama", near, { provider: "ollama", providerModel: "good-model" }]];
+  if (!rootConfig) senders.push(["Claude login", anth, { provider: "claude", model: "haiku", effort: "low" }]);
+  for (const [name, from, msg] of senders) {
+    const login = name === "Claude login";
+    if (login) Object.assign(process.env, { ANTHROPIC_API_KEY: "fake-anthropic-key-0000000000", ANTHROPIC_BASE_URL: anth.base });
+    fresh();
+    msgs = await turn(Object.assign({ text: "see this", attachments: [attach("private.txt", "ATTACHEDMARKER")] }, msg));
+    const file = attachedPath(from.calls);
+    const sid = sidOf(msgs);
+    check(`a chat on ${name} saves its attachment`, !!file && fs.readFileSync(file, "utf8") === "ATTACHEDMARKER", file);
+    const live = chatOf(sid);
+    check(`${name} gets one folder of its own`, live.proc.spawnargs.filter((a) => a === "--add-dir").length === 1 && live.proc.spawnargs.includes(live.attachDir) && file.startsWith(live.attachDir), live.proc.spawnargs.join(" ").slice(0, 200));
+    from.plan = ["Read", { file_path: file }];
+    msgs = await turn(Object.assign({ sessionId: sid }, msg));
+    check(`${name} can read its own attachment`, /ATTACHEDMARKER/.test(JSON.stringify(from.calls.at(-1))), said(msgs));
+    if (login) { delete process.env.ANTHROPIC_API_KEY; delete process.env.ANTHROPIC_BASE_URL; }
+
+    for (const mode of ["acceptEdits", "default", "auto"]) {
+      fresh();
+      stub.plan = ["Read", { file_path: file }];
+      msgs = await turn({ permissionMode: mode });
+      check(`an outside chat in ${mode} can't read an attachment from ${name}`, !/ATTACHEDMARKER/.test(said(msgs)) && /denied|permission|blocking/i.test(said(msgs)), said(msgs));
+    }
+    stub.plan = ["Grep", { pattern: "ATTACHED", path: path.dirname(path.dirname(path.dirname(file))), output_mode: "content" }];
+    msgs = await turn({});
+    check(`an outside chat can't search the attachments of ${name}`, /denied/.test(said(msgs)), said(msgs));
+    check(`nothing attached on ${name} reached the provider`, !reached(/ATTACHEDMARKER/));
+
+    await gone(live);
+    check(`the attachment on ${name} goes when the chat ends`, !fs.existsSync(live.attachDir));
+    fresh();
+    stub.plan = ["Read", { file_path: file }];
+    msgs = await turn({});
+    check(`a later outside chat finds nothing from ${name}`, !/ATTACHEDMARKER/.test(said(msgs)), said(msgs));
+  }
+
+  fresh();
+  msgs = await turn({ text: "see this", attachments: [attach("mine.txt", "OWNATTACHMENT")] });
+  const own = attachedPath(stub.calls);
+  stub.plan = ["Read", { file_path: own }];
+  const ownSid = sidOf(msgs);
+  msgs = await turn({ sessionId: ownSid });
+  check("an outside chat can read its own attachment", /OWNATTACHMENT/.test(said(msgs)), said(msgs));
+  const ownChat = chatOf(ownSid);
+  await gone(ownChat);
+  check("an outside chat's attachment goes when the chat ends", !fs.existsSync(own));
+
+  // A chat that moves outside starts again, and what the user just attached moves with it.
+  fresh();
+  msgs = await turn(Object.assign({ text: "hello" }, senders[0][2]));
+  msgs = await turn({ sessionId: sidOf(msgs), text: "see this", attachments: [attach("moved.txt", "MOVEDATTACHMENT")] });
+  const moved = attachedPath(stub.calls);
+  check("an attachment survives the chat starting again", !!moved && fs.readFileSync(moved, "utf8") === "MOVEDATTACHMENT" && msgs.some((m) => m.type === "notice"), moved);
+
+  // Left behind by a crash: the next start clears old folders and keeps new ones.
+  const leftover = path.join(host.attachRoot(false), "leftover");
+  const recent = path.join(host.attachRoot(false), "recent");
+  for (const d of [leftover, recent]) fs.mkdirSync(d, { recursive: true });
+  fs.utimesSync(leftover, new Date(0), new Date(0));
+  host.sweepAttachments();
+  check("old attachment folders are cleared at start", !fs.existsSync(leftover) && fs.existsSync(recent));
+  fs.rmSync(recent, { recursive: true, force: true });
+
+  // ---------- local chats in a Claude session ----------
+  // Started inside the Claude desktop app, Claude Code sends its login instead of the translator's token.
+  const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT;
+  for (const value of ["claude-desktop", ""]) {
+    if (value) process.env.CLAUDE_CODE_ENTRYPOINT = value; else delete process.env.CLAUDE_CODE_ENTRYPOINT;
+    fresh();
+    msgs = await turn(Object.assign({ text: "hello" }, senders[0][2]));
+    check(`a local chat answers ${value ? "inside the Claude desktop app" : "outside any Claude session"}`, /hello from good-model/.test(said(msgs)), said(msgs));
+    await gone(chatOf(sidOf(msgs)));
+  }
+  if (entrypoint) process.env.CLAUDE_CODE_ENTRYPOINT = entrypoint; else delete process.env.CLAUDE_CODE_ENTRYPOINT;
+
   // Other chats on this computer use another config, so an outside chat can't see them.
   stub.plan = ["ListAgents", {}];
   msgs = await turn({});
@@ -261,6 +371,8 @@ function client(port) {
   // ---------- everything the provider ever saw ----------
   check("no 10 Money, trash or nested text reached the outside stub", !reached(SECRET));
   check("no old transcript text reached it", !reached(/OLDCHATMARKER/));
+  check("no git status or commit messages reached it", !reached(/gitstatusmarker|GITLOGMARKER/));
+  check("control: a local chat does get them", /GITLOGMARKER/.test(JSON.stringify(near.calls)));
   for (const m of marks) check(`no user config text reached it: ${m.slice(0, 40)}`, !has(m));
 
   c.ws.close();
