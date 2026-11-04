@@ -56,7 +56,7 @@ Keep Obsidian open on the computer, and keep the computer awake, while you use i
 - By default the host only listens on `127.0.0.1` and, when enabled, your Tailscale address. Every connection must send the pairing code within five seconds, or it is closed.
 - **Any network** listens on every interface. Only use it on a network you trust, and prefer Tailscale.
 - Tapping **New code** in settings signs out every paired device.
-- `10 Money` stays out of every chat, on every provider and in every mode: Claude Code starts with deny rules for its file tools, and open notes there are left out of what a message sends. One gap remains: a shell search from the vault root, such as `grep -r`, can still reach the folder. The model is told to leave it out, which is an instruction, not a block.
+- `10 Money` stays out of every chat, on every provider and in every mode: Claude Code starts with deny rules for its file tools, and open notes there are left out of what a message sends. Chats on outside providers have no shell at all, and the chat says so. They search with the Grep and Glob tools instead, which skip the folder. On Claude login, the Anthropic API and local models, a shell search from the vault root, such as `grep -r`, can still reach the folder. The model is told to leave it out, which is an instruction, not a block.
 - The connection is plain `ws://`. Tailscale encrypts traffic between your devices. Don't expose the port to the internet.
 
 ## Troubleshooting
@@ -95,7 +95,11 @@ Supported: Anthropic API, OpenAI, Google Gemini, DeepSeek, xAI, OpenRouter, Groq
 
 **Keys** stay on the computer that runs the host. Set the provider's usual environment variable (for example `DEEPSEEK_API_KEY`), or save the key in settings, which seals it with the OS keychain in that device's local storage. Keys are never written to `data.json`, so sync can't copy them, and settings only ever show whether one is set. Provider keys are kept out of Claude Code's environment; `ANTHROPIC_API_KEY` is the one exception, because Claude Code reads it itself.
 
-**Models** are listed live where the provider offers a list. Pick **Type a model…** in the brain menu for anything else. A model that can't use tools still answers: the chat says it is running text only, and it can't read or change notes on that turn.
+**Models** are listed live where the provider offers a list. Pick **Type a model…** in the brain menu for anything else.
+
+**Shell commands** are off for every provider except Ollama, LM Studio, Claude login and the Anthropic API, and the chat says so when it starts. A custom endpoint counts as outside, even at a localhost address.
+
+A model that can't use tools still answers: the chat says it is running text only, and it can't read or change notes on that turn.
 
 ## Build log
 

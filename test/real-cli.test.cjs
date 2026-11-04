@@ -49,6 +49,7 @@ function client(port) {
   stub.key = FAKE_KEY;
   for (const p of Object.values(PROVIDERS)) { if (p.env) delete process.env[p.env]; if (p.local) p.base = "http://127.0.0.1:9/v1"; }
   PROVIDERS.openai.base = stub.base;
+  PROVIDERS.lmstudio.base = stub.base;
   process.env.OPENAI_API_KEY = FAKE_KEY;
 
   const logs = [];
@@ -83,8 +84,6 @@ function client(port) {
   const moneyTools = [
     ["a relative Read", "Read", { file_path: "10 Money/Bank/statement.md" }],
     ["a path through ..", "Read", { file_path: path.join(vault, "x", "..", "10 Money", "Bank", "statement.md") }],
-    ["Bash cat", "Bash", { command: "cat '10 Money/Bank/statement.md'" }],
-    ["an allowed shell command", "Bash", { command: "python3 -c \"print(open('10 Money/Bank/statement.md').read())\"" }],
     ["Edit", "Edit", { file_path: money, old_string: "balance", new_string: "changed" }],
     ["Write", "Write", { file_path: path.join(vault, "10 Money", "new.md"), content: "x" }],
   ];
@@ -93,6 +92,45 @@ function client(port) {
     msgs = await turn({ provider: "openai", providerModel: "good-model", text: "go" });
     check(`${name} into 10 Money is refused`, refusedBy(msgs), result(msgs).result);
   }
+  // A local model keeps its shell, so the rule naming the folder has to hold there.
+  const local = { provider: "lmstudio", providerModel: "good-model", text: "go" };
+  for (const [name, command] of [["Bash cat", "cat '10 Money/Bank/statement.md'"], ["an allowed shell command", "python3 -c \"print(open('10 Money/Bank/statement.md').read())\""]]) {
+    stub.plan = ["Bash", { command }];
+    msgs = await turn(local);
+    check(`${name} into 10 Money is refused on a local model`, refusedBy(msgs), result(msgs).result);
+  }
+
+  // Outside providers have no shell at all. The search tools take over, and those honour the rules.
+  const outside = { provider: "openai", providerModel: "good-model", text: "go" };
+  const outsideFrom = stub.calls.length;
+  stub.plan = ["Bash", { command: "grep -r SECRET ." }];
+  msgs = await turn(outside);
+  check("grep -r from the vault root is refused on an outside provider", !/BANKSECRET/.test(JSON.stringify(msgs)) && /no such tool|denied/i.test(result(msgs).result || ""), result(msgs).result);
+  check("the chat says shell commands are off", msgs.filter((m) => m.type === "warning" && /Shell commands are off for OpenAI/.test(m.message)).length === 1, msgs.map((m) => m.type));
+  for (const [name, tool, input, answer] of [
+    ["Grep from the vault root", "Grep", { pattern: "SECRET", path: ".", output_mode: "content" }, /No matches/],
+    ["Grep naming the folder", "Grep", { pattern: "SECRET", path: "10 Money", output_mode: "content" }, /denied/],
+    ["Glob from the vault root", "Glob", { pattern: "**/*.md" }, /note\.md/],
+    ["Glob naming the folder", "Glob", { pattern: "**/*", path: "10 Money" }, /denied/],
+  ]) {
+    stub.plan = [tool, input];
+    msgs = await turn(outside);
+    check(`${name} finds nothing in 10 Money`, answer.test(result(msgs).result || "") && !/BANKSECRET|statement/.test(JSON.stringify(msgs)), result(msgs).result);
+  }
+  stub.plan = ["Agent", { description: "search", prompt: "search the vault", subagent_type: "general-purpose" }];
+  stub.next = ["Bash", { command: "grep -r SECRET ." }];
+  msgs = await turn(outside);
+  // The subagent runs in the background and its report comes back as one more call.
+  for (let seen = -1; seen !== stub.calls.length;) { seen = stub.calls.length; await new Promise((r) => setTimeout(r, 2500)); }
+  const outsideCalls = stub.calls.slice(outsideFrom);
+  check("the subagent ran", new Set(outsideCalls.map((x) => x.tools.length)).size > 1, outsideCalls.length);
+  check("no outside call, subagent included, is offered a shell", outsideCalls.every((x) => !x.tools.some((t) => /^(Bash|PowerShell|Monitor)$/.test(t.function.name))), outsideCalls.length);
+
+  stub.plan = ["Bash", { command: "cat note.md" }];
+  msgs = await turn(local);
+  check("a local model still runs shell commands", /marigold/.test(result(msgs).result || ""), result(msgs).result);
+  check("and isn't told they're off", !msgs.some((m) => m.type === "warning"), msgs.filter((m) => m.type === "warning"));
+
   check("nothing in 10 Money changed", fs.readFileSync(money, "utf8") === "BANKSECRET balance\n" && !fs.existsSync(path.join(vault, "10 Money", "new.md")));
   check("no 10 Money text reached the provider", !JSON.stringify(stub.calls).includes("BANKSECRET"));
   stub.plan = ["Read", { file_path: note }];

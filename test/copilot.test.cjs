@@ -154,15 +154,15 @@ const resultOf = (msgs) => { const r = msgs.find((m) => m.type === "event" && m.
   msgs = await turn(c, { provider: "openai", providerModel: "no-tools" });
   check("a model that refuses tools still answers", resultOf(msgs).result === "hello from no-tools", msgs);
   check("it was asked with tools, then again without", stub.calls.length === 2 && !!stub.calls[0].tools && !stub.calls[1].tools, stub.calls.map((x) => !!x.tools));
-  const warn = msgs.filter((m) => m.type === "warning");
-  check("the chat is told it's text only, once", warn.length === 1 && /text only/.test(warn[0].message), warn);
+  const warn = msgs.filter((m) => m.type === "warning" && /text only/.test(m.message));
+  check("the chat is told it's text only, once", warn.length === 1, warn);
   check("the model is told not to write tool calls", /No tools are available/.test(stub.calls[1].messages[0].content));
   stub.calls.length = 0;
   msgs = await turn(c, { provider: "openai", providerModel: "no-tools" });
   check("the next turn skips the failed try", stub.calls.length === 1 && !stub.calls[0].tools, stub.calls.length);
   stub.calls.length = 0;
   msgs = await turn(c, { provider: "openai", providerModel: "plain-model" });
-  check("a model the list marks goes without tools from the start", stub.calls.length === 1 && !stub.calls[0].tools && msgs.some((m) => m.type === "warning"), stub.calls.length);
+  check("a model the list marks goes without tools from the start", stub.calls.length === 1 && !stub.calls[0].tools && msgs.some((m) => m.type === "warning" && /text only/.test(m.message)), stub.calls.length);
   stub.calls.length = 0;
   msgs = await turn(c, { provider: "openai", providerModel: "rejects" });
   check("another 400 isn't retried and shows the provider's words", stub.calls.length === 1 && resultOf(msgs).is_error && /OpenAI: context too long/.test(resultOf(msgs).result), resultOf(msgs));
@@ -233,6 +233,25 @@ const resultOf = (msgs) => { const r = msgs.find((m) => m.type === "event" && m.
   const plain = host.buildPrompt({ text: "hi", context: { activeFile: "ok.md", selection: "words" } }, []);
   check("other notes keep their context", /ok\.md/.test(plain) && /words/.test(plain), plain);
 
+  // ---------- shell on outside providers ----------
+  T.PROVIDERS.lmstudio.base = stub.base;
+  const shellOff = (a) => ["Bash", "PowerShell"].every((rule) => denied(a).includes(rule));
+  const shellFor = async (msg) => { const m = await turn(c, msg); const a = seen().at(-1).args; return { off: shellOff(a), told: m.some((x) => x.type === "warning" && /Shell commands are off/.test(x.message)), asked: a.some((x) => x.includes("Shell commands are off in this chat")), msgs: m }; };
+  for (const [name, msg] of [["OpenAI", { provider: "openai", providerModel: "good-model" }], ["Mistral", { provider: "mistral", providerModel: "good-model" }], ["a custom endpoint at localhost", { provider: "custom-a", providerModel: "typed-model" }]]) {
+    const r = await shellFor(msg);
+    check(`${name}: no shell, and the chat and the model are told`, r.off && r.told && r.asked, [r.off, r.told, r.asked]);
+  }
+  for (const [name, msg] of [["LM Studio", { provider: "lmstudio", providerModel: "good-model" }], ["Anthropic API", { provider: "anthropic", providerModel: "claude-test", effort: "high" }], ["Claude login", { provider: "claude", model: "sonnet", effort: "low" }]]) {
+    const r = await shellFor(msg);
+    check(`${name}: shell stays, nothing said`, !r.off && !r.told && !r.asked, [r.off, r.told, r.asked]);
+  }
+  const first = await shellFor({ provider: "openai", providerModel: "good-model" });
+  const sessionId = first.msgs.find((m) => m.type === "event" && m.event.session_id).event.session_id;
+  const again = await shellFor({ provider: "openai", providerModel: "good-model", sessionId });
+  check("the chat is told once, not every turn", first.told && !again.told, [first.told, again.told]);
+
+  // Every spare timer has fired by now, including the one for the xAI key removed above.
+  await new Promise((r) => setTimeout(r, 4500));
   const raw = await new Promise((r) => http.get(`http://127.0.0.1:${PORT}/status`, (res) => { let t = ""; res.on("data", (d) => { t += d; }); res.on("end", () => r(t)); }));
   const st = JSON.parse(raw);
   check("/status gives the version and nothing else", st.app === "quartzi-copilot" && st.version === "0.9.0" && Object.keys(st).length === 2, st);

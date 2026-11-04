@@ -1,6 +1,7 @@
 // A local OpenAI-style provider for tests, streaming like the real ones. No account, no network.
 // good-model reads a file with a tool, then answers. no-tools refuses tools. bad-key is a 401.
 // Set s.plan = [tool, input] and the next reply calls that tool, then repeats what it got back.
+// s.next is the same for the reply after that.
 // usage: require it, or: node test/stub-provider.cjs [port]
 const http = require("http");
 
@@ -26,7 +27,8 @@ function start(port = 0) {
       if (!body.stream) return json(200, { choices: [{ finish_reason: "stop", message: { content: "ok" } }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
       res.writeHead(200, { "content-type": "text/event-stream" });
       const plan = s.plan;
-      s.plan = null;
+      s.plan = s.next || null;
+      s.next = null;
       if (plan || wantsTool || count) {
         const [name, input] = plan || (count ? ["Glob", { pattern: "**/*.md" }] : ["Read", { file_path: s.file }]);
         chunk(res, { choices: [{ delta: { tool_calls: [{ index: 0, id: `call_${s.calls.length}`, type: "function", function: { name, arguments: "" } }] } }] });

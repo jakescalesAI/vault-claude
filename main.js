@@ -93,6 +93,9 @@ function diagnose({ url, mobile, unpaired, probe, version, last }) {
 // Why the build log can't go at this path, or "" if it can.
 // 10 Money stays out of every chat: what a chat reads reaches whichever provider it runs on.
 const PRIVATE_DENY = ["Read(./10 Money/**)", "Edit(./10 Money/**)", "Bash(*10 Money*)", "PowerShell(*10 Money*)"];
+// Chats that leave this computer get no shell, because a plain grep -r would carry 10 Money with it.
+const SHELL_DENY = ["Bash", "PowerShell", "Monitor"];
+const NO_SHELL_PROMPT = "Shell commands are off in this chat. If a task needs one, say so plainly.";
 const PRIVATE_PROMPT = "Never read, search, list or edit the 10 Money folder, even if asked. Leave it out of any shell search, for example grep --exclude-dir=\"10 Money\".";
 
 function isPrivate(path) {
@@ -2300,9 +2303,16 @@ class Host {
     return [mode, model, effort].join("|");
   }
 
-  systemPrompt() {
+  // Every provider but the local ones sends the chat to a third party. A custom endpoint counts
+  // as outside even at a localhost address, since it can forward anywhere.
+  offComputer(provider) {
+    const p = provider && this.providerDef(provider);
+    return !!p && p.kind !== "anthropic" && !p.local;
+  }
+
+  systemPrompt(noShell) {
     const log = this.config.logPath;
-    const base = `${SYSTEM_PROMPT}\n${PRIVATE_PROMPT}`;
+    const base = [SYSTEM_PROMPT, PRIVATE_PROMPT, noShell ? NO_SHELL_PROMPT : ""].filter(Boolean).join("\n");
     return log ? `${base}\nWhen the user asks you to log a build or a publish, add one plain bullet (never a checkbox) with the date to the note ${log}.` : base;
   }
 
@@ -2313,9 +2323,11 @@ class Host {
     const [mode, model, effort, provider] = sig.split("|");
     const attachRoot = path.join(this.tmp, "attachments");
     fs.mkdirSync(attachRoot, { recursive: true });
+    const noShell = this.offComputer(provider);
+    const deny = noShell ? PRIVATE_DENY.concat(SHELL_DENY) : PRIVATE_DENY;
     const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-      "--include-partial-messages", "--append-system-prompt", this.systemPrompt(), "--add-dir", attachRoot,
-      "--permission-mode", mode, "--model", model, "--settings", JSON.stringify({ permissions: { deny: PRIVATE_DENY } })];
+      "--include-partial-messages", "--append-system-prompt", this.systemPrompt(noShell), "--add-dir", attachRoot,
+      "--permission-mode", mode, "--model", model, "--settings", JSON.stringify({ permissions: { deny } })];
     // Other providers run through the local translator with Claude Code's built-in tools.
     // MCP servers stay off there: their hundreds of tools exceed what those APIs accept.
     const translated = provider && this.providerDef(provider).kind !== "anthropic";
@@ -2407,6 +2419,9 @@ class Host {
 
   ensureSpare(sig) {
     if (this.stopped) return;
+    // The key can go between the turn and this timer.
+    const provider = sig.split("|")[3];
+    if (provider && !this.providerConfig(provider)) return;
     if (this.spare && !this.spare.dead && this.spare.sig === sig) return;
     if (this.spare) this.kill(this.spare);
     this.spare = this.spawnClaude(sig, null);
@@ -2434,6 +2449,10 @@ class Host {
     c.interrupted = false;
     c.turn = { ws, msg, saved, events: 0 };
     ws.current = c;
+    if (this.offComputer(pid) && !c.warnedShell) {
+      c.warnedShell = true;
+      ws.send({ type: "warning", message: `Shell commands are off for ${this.providerDef(pid).name}, because this chat leaves your computer. It can still read and edit your notes.` });
+    }
     c.proc.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: this.buildPrompt(msg, saved) } }) + "\n");
     // Have the next new chat's process ready by the time it's wanted.
     setTimeout(() => this.ensureSpare(sig), 4000);
