@@ -110,6 +110,17 @@
     check("the brain menu lists providers that are set", names.includes("OpenAI") && names.includes("My server") && names.includes("Anthropic API"), names);
     check("it leaves out ones that aren't", !names.includes("DeepSeek"), names);
     const choose = (id) => { const s = brain().querySelector("select"); s.value = id; s.onchange(); };
+    const modes = () => [...brain().querySelector(".vc-seg").querySelectorAll(".vc-seg-btn")].map((b) => b.textContent).join(" ");
+    check("Claude offers every mode", modes() === "Auto Edit Plan Read", modes());
+    plugin.settings.permissionMode = "plan";
+    choose("openai");
+    check("an outside provider offers Edit and Read only", modes() === "Edit Read", modes());
+    check("and shows Edit when Plan was saved", brain().querySelector(".vc-seg-btn.is-active").textContent === "Edit");
+    choose("custom-a");
+    check("so does a custom endpoint", modes() === "Edit Read", modes());
+    choose("anthropic");
+    check("the Anthropic API offers every mode", modes() === "Auto Edit Plan Read", modes());
+    plugin.settings.permissionMode = "acceptEdits";
     choose("openai");
     menu = brain();
     names = [...menu.querySelectorAll("select option")].map((o) => o.textContent);

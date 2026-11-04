@@ -3,7 +3,7 @@
 const http = require("http");
 
 function start() {
-  const s = { calls: [], plan: null };
+  const s = { calls: [], auth: [], plan: null };
   s.server = http.createServer((req, res) => {
     let raw = "";
     req.on("data", (d) => { raw += d; });
@@ -12,6 +12,7 @@ function start() {
       if (/count_tokens/.test(req.url)) return json({ input_tokens: 1 });
       const body = raw ? JSON.parse(raw) : {};
       s.calls.push(body);
+      s.auth.push(String(req.headers.authorization || ""));
       const usage = { input_tokens: 1, output_tokens: 1 };
       if (!body.stream) return json({ id: "m", type: "message", role: "assistant", model: body.model, content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage });
       res.writeHead(200, { "content-type": "text/event-stream" });

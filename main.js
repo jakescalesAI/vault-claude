@@ -26,6 +26,8 @@ const MODELS = [["fable", "Fable"], ["opus", "Opus"], ["sonnet", "Sonnet"], ["ha
 const QUARTZI_MARK = '<g transform="scale(1.5625)" fill="currentColor"><polygon points="35.54,12.91 39.42,16.80 16.80,39.42 12.91,35.54"/><polygon opacity=".85" points="39.42,16.80 47.20,24.58 24.58,47.20 16.80,39.42"/><polygon opacity=".45" points="47.20,24.58 51.09,28.46 28.46,51.09 24.58,47.20"/><polygon opacity=".95" points="35.54,12.91 39.42,16.80 51.09,12.91"/><polygon opacity=".9" points="39.42,16.80 47.20,24.58 51.09,12.91"/><polygon opacity=".55" points="47.20,24.58 51.09,28.46 51.09,12.91"/><polygon opacity=".93" points="12.91,35.54 16.80,39.42 12.91,51.09"/><polygon opacity=".78" points="16.80,39.42 24.58,47.20 12.91,51.09"/><polygon opacity=".35" points="24.58,47.20 28.46,51.09 12.91,51.09"/></g>';
 const EFFORTS = [["low", "Low"], ["medium", "Med"], ["high", "High"], ["max", "Max"]];
 const MODES = [["auto", "Auto"], ["acceptEdits", "Edit"], ["plan", "Plan"], ["default", "Read"]];
+// Plan and Auto read files anywhere on the computer without asking, and an outside chat would send them on.
+const OUTSIDE_MODES = MODES.filter(([v]) => v === "acceptEdits" || v === "default");
 const FILE_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
 // SF Symbols-style line icons: 24px grid, stroke 2, round caps.
@@ -320,7 +322,9 @@ class VaultClaudeView extends ItemView {
       menu.createDiv({ cls: "vc-menu-section", text: title });
       this.segmented(menu, options, s[key], (v) => { s[key] = v; this.plugin.saveSettings(); this.updateBrain(); });
     };
-    group("Mode", MODES, "permissionMode");
+    const providers = this.readyProviders();
+    const provider = providers.find((x) => x.id === s.provider);
+    group("Mode", provider && provider.kind !== "anthropic" && !provider.local ? OUTSIDE_MODES : MODES, "permissionMode");
     const pick = (title, options, value, onChange) => {
       menu.createDiv({ cls: "vc-menu-section", text: title });
       const sel = menu.createEl("select", { cls: "dropdown vc-select" });
@@ -328,8 +332,6 @@ class VaultClaudeView extends ItemView {
       sel.value = value;
       sel.onchange = () => onChange(sel.value);
     };
-    const providers = this.readyProviders();
-    const provider = providers.find((x) => x.id === s.provider);
     const redraw = () => { this.plugin.saveSettings(); this.updateBrain(); this.closeMenu(); this.openSettingsMenu(); };
     pick("Provider", [["claude", "Claude"], ...providers.map((x) => [x.id, x.name])], provider ? s.provider : "claude", (v) => {
       s.provider = v;
@@ -2286,12 +2288,13 @@ class Host {
 
   providerEnv(provider, model) {
     const cfg = this.providerConfig(provider);
+    const env = this.childEnv();
+    // Inside a Claude desktop session this makes Claude Code send its login wherever the chat goes.
+    delete env.CLAUDE_CODE_ENTRYPOINT;
     if (cfg.kind === "anthropic") {
-      const env = this.childEnv();
       delete env.ANTHROPIC_AUTH_TOKEN;
       return Object.assign(env, { ANTHROPIC_API_KEY: cfg.key, ANTHROPIC_BASE_URL: cfg.base });
     }
-    const env = this.childEnv();
     if (this.offComputer(provider)) {
       // Git Bash stays: Claude Code won't start on Windows without it, even with the shell off.
       for (const k of Object.keys(env)) if (/^CLAUDE_CODE_/.test(k) && k !== "CLAUDE_CODE_GIT_BASH_PATH") delete env[k];
@@ -2301,7 +2304,7 @@ class Host {
     return Object.assign(env, {
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${this.translatorPort}/p/${provider}`,
       ANTHROPIC_AUTH_TOKEN: this.translatorToken,
-      // A logged-in Claude Code sends its own login as the authorization header instead.
+      // Its own header, so the token still arrives if a login takes the authorization header.
       ANTHROPIC_CUSTOM_HEADERS: `x-copilot-token: ${this.translatorToken}`,
       ANTHROPIC_API_KEY: "",
       ANTHROPIC_MODEL: model,
@@ -2361,18 +2364,23 @@ class Host {
   // running between messages (stream-json input), and one spare is kept warm for the next
   // new chat. Changing mode, model or effort starts a new process that resumes the same chat.
   signature(msg) {
-    const mode = PERMISSION_MODES.has(msg.permissionMode) ? msg.permissionMode : "acceptEdits";
     const provider = this.providerDef(msg.provider) ? msg.provider : "claude";
+    const mode = this.allowedMode(msg.permissionMode, provider) ? msg.permissionMode : "acceptEdits";
     const effort = EFFORT_LEVELS.has(msg.effort) ? msg.effort : DEFAULT_SETTINGS.effort;
     if (provider !== "claude") return [mode, MODEL_ID.test(msg.providerModel || "") ? msg.providerModel : "", effort, provider].join("|");
     const model = msg.model && /^[\w.-]+$/.test(msg.model) ? msg.model : DEFAULT_SETTINGS.model;
     return [mode, model, effort].join("|");
   }
 
+  allowedMode(mode, provider) {
+    if (!PERMISSION_MODES.has(mode)) return false;
+    return !this.offComputer(provider) || OUTSIDE_MODES.some(([v]) => v === mode);
+  }
+
   // Every provider but the local ones sends the chat to a third party. A custom endpoint counts
   // as outside even at a localhost address, since it can forward anywhere.
   offComputer(provider) {
-    const p = provider && this.providerDef(provider);
+    const p = provider && provider !== "claude" && this.providerDef(provider);
     return !!p && p.kind !== "anthropic" && !p.local;
   }
 
@@ -2528,6 +2536,10 @@ class Host {
     c.interrupted = false;
     c.turn = { ws, msg, events: 0 };
     ws.current = c;
+    // An older device can still ask for a mode the menu no longer offers.
+    const refused = PERMISSION_MODES.has(msg.permissionMode) && !this.allowedMode(msg.permissionMode, pid);
+    if (refused && !ws.toldMode) ws.send({ type: "warning", message: `Plan and Auto are off for ${this.providerDef(pid).name}, because they can read files anywhere on your computer. This chat runs in Edit.` });
+    ws.toldMode = refused;
     if (this.offComputer(pid) && !c.warnedShell) {
       c.warnedShell = true;
       ws.send({ type: "warning", message: `Shell commands are off for ${this.providerDef(pid).name}, because this chat leaves your computer. It can still read and edit your notes.` });

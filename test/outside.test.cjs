@@ -17,6 +17,8 @@ new Function("require", "module", fs.readFileSync(path.join(__dirname, "..", "ma
 const { Host, PROVIDERS } = mod.exports.__t;
 
 const rootConfig = process.argv.includes("--root-config");
+// This machine's real login must never be sent to a stub, whatever the code under test does.
+if (rootConfig) delete process.env.CLAUDE_CODE_ENTRYPOINT;
 const SECRET = /BANKSECRET|NESTSECRET|TRASHSECRET/;
 let passed = 0, failed = 0;
 function check(name, ok, detail) {
@@ -351,17 +353,94 @@ function client(port) {
   check("old attachment folders are cleared at start", !fs.existsSync(leftover) && fs.existsSync(recent));
   fs.rmSync(recent, { recursive: true, force: true });
 
-  // ---------- local chats in a Claude session ----------
-  // Started inside the Claude desktop app, Claude Code sends its login instead of the translator's token.
-  const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT;
-  for (const value of ["claude-desktop", ""]) {
-    if (value) process.env.CLAUDE_CODE_ENTRYPOINT = value; else delete process.env.CLAUDE_CODE_ENTRYPOINT;
+  // ---------- Plan and Auto ----------
+  // Both read anywhere on the computer without asking, so an outside chat never runs in them.
+  const away = path.join(tmp, "elsewhere");
+  const plant = (file, text) => { const p = path.join(away, file); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text); return p; };
+  const wide = [
+    ["an SSH key", "Read", { file_path: plant(".ssh/id_rsa", "WIDEMARKER key\n") }],
+    ["a Claude login file", "Read", { file_path: plant(".claude/.credentials.json", "WIDEMARKER login\n") }],
+    ["AWS credentials", "Read", { file_path: plant(".aws/credentials", "WIDEMARKER aws\n") }],
+    ["another vault's 10 Money", "Read", { file_path: plant("Other Vault/10 Money/bank.md", "WIDEMARKER money\n") }],
+    ["another vault's note", "Read", { file_path: plant("Other Vault/note.md", "WIDEMARKER note\n") }],
+    ["another vault's plugin data", "Read", { file_path: plant("Other Vault/.obsidian/plugins/x/data.json", "WIDEMARKER data\n") }],
+    ["a project's .env", "Read", { file_path: plant("project/.env", "WIDEMARKER env\n") }],
+    ["/etc/passwd", "Read", { file_path: "/etc/passwd" }],
+    ["a search of the folder", "Grep", { pattern: "WIDE", path: away, output_mode: "content" }],
+    ["a list of the folder", "Glob", { pattern: "**/*", path: away }],
+  ];
+  fs.writeFileSync(path.join(tmp, "sibling.md"), "WIDEMARKER sibling\n");
+  wide.push(["a file beside the vault", "Read", { file_path: "../sibling.md" }]);
+  const wideText = /WIDEMARKER|root:x:0|id_rsa\b.*credentials/s;
+  for (const mode of ["plan", "auto"]) {
     fresh();
-    msgs = await turn(Object.assign({ text: "hello" }, senders[0][2]));
-    check(`a local chat answers ${value ? "inside the Claude desktop app" : "outside any Claude session"}`, /hello from good-model/.test(said(msgs)), said(msgs));
+    msgs = await turn({ text: "hello", permissionMode: mode });
+    const running = chatOf(sidOf(msgs)).proc.spawnargs;
+    check(`asked for ${mode}, an outside chat runs in Edit`, running[running.indexOf("--permission-mode") + 1] === "acceptEdits", running.join(" ").slice(0, 200));
+    check(`asked for ${mode}, the chat says so`, msgs.some((m) => m.type === "warning" && /Plan and Auto are off for OpenAI/.test(m.message)), msgs.map((m) => m.type));
+    msgs = await turn({ sessionId: sidOf(msgs), text: "hello", permissionMode: mode });
+    check(`it says so once for ${mode}`, !msgs.some((m) => m.type === "warning" && /Plan and Auto/.test(m.message)), msgs.map((m) => m.type));
+    for (const [name, tool, input] of wide) {
+      stub.plan = [tool, input];
+      msgs = await turn({ permissionMode: mode });
+      check(`asked for ${mode}, ${name} is refused`, !wideText.test(said(msgs)) && /permission|denied/i.test(said(msgs)), said(msgs));
+    }
+    msgs = await turn({ text: "hello" });
+  }
+  check("nothing from elsewhere on the computer reached the provider", !reached(/WIDEMARKER|root:x:0/));
+  // The mode can't change from inside the chat.
+  fresh();
+  msgs = await turn({ text: "hello" });
+  check("no tool to enter Plan mode", !stub.calls.at(-1).tools.some((t) => t.function.name === "EnterPlanMode"));
+  const sameChat = sidOf(msgs);
+  stub.plan = ["EnterPlanMode", {}];
+  msgs = await turn({ sessionId: sameChat });
+  check("a model that asks for Plan mode anyway is refused", /No such tool/.test(said(msgs)), said(msgs));
+  msgs = await turn({ sessionId: sameChat, text: "/plan" });
+  stub.plan = ["Read", wide[0][2]];
+  msgs = await turn({ sessionId: sameChat });
+  check("typing /plan doesn't open the door", !wideText.test(said(msgs)) && /permission/i.test(said(msgs)), said(msgs));
+  stub.plan = ["Agent", { description: "look", prompt: "read it", subagent_type: "general-purpose" }];
+  stub.next = ["Read", wide[0][2]];
+  msgs = await turn({ sessionId: sameChat });
+  for (let count = -1; count !== stub.calls.length;) { count = stub.calls.length; await new Promise((r) => setTimeout(r, 5000)); }
+  stub.next = null;
+  check("a subagent can't read elsewhere either", !reached(/WIDEMARKER|root:x:0/));
+  // Local chats keep every mode, and this one proves the files above could be read.
+  for (const mode of ["auto", "acceptEdits", "plan", "default"]) {
+    fresh();
+    msgs = await turn(Object.assign({ text: "hello", permissionMode: mode }, senders[0][2]));
+    const running = chatOf(sidOf(msgs)).proc.spawnargs;
+    check(`a local chat keeps ${mode}`, running[running.indexOf("--permission-mode") + 1] === mode && !msgs.some((m) => m.type === "warning" && /Plan and Auto/.test(m.message)), running.join(" ").slice(0, 200));
+    if (mode === "plan") {
+      near.plan = ["Read", wide[0][2]];
+      msgs = await turn(Object.assign({ sessionId: sidOf(msgs), permissionMode: mode }, senders[0][2]));
+      check("control: a local chat in Plan does read elsewhere", /WIDEMARKER/.test(JSON.stringify(near.calls.at(-1))), said(msgs));
+    }
     await gone(chatOf(sidOf(msgs)));
   }
-  if (entrypoint) process.env.CLAUDE_CODE_ENTRYPOINT = entrypoint; else delete process.env.CLAUDE_CODE_ENTRYPOINT;
+
+  // ---------- inside a Claude desktop session ----------
+  // With this value Claude Code sends its login instead of the token it's given. Never with a real login.
+  if (!rootConfig) {
+    const logins = [];
+    host.translator.prependListener("request", (q) => logins.push(String(q.headers.authorization || "")));
+    const fakeLogin = (list) => list.some((a) => a.includes("fake-login-token"));
+    process.env.CLAUDE_CODE_ENTRYPOINT = "claude-desktop";
+    fresh();
+    msgs = await turn(Object.assign({ text: "hello" }, senders[0][2]));
+    check("a local chat answers inside the Claude desktop app", /hello from good-model/.test(said(msgs)), said(msgs));
+    check("the login doesn't reach the translator", logins.length > 0 && !fakeLogin(logins), logins.length);
+    await gone(chatOf(sidOf(msgs)));
+    process.env.ANTHROPIC_API_KEY = "fake-anthropic-key-0000000000";
+    fresh();
+    anth.auth.length = 0;
+    msgs = await turn({ text: "hello", provider: "anthropic", providerModel: "good-model", effort: "low" });
+    check("the login doesn't go to the Anthropic API either", anth.auth.length > 0 && !fakeLogin(anth.auth), anth.auth.length);
+    await gone(chatOf(sidOf(msgs)));
+    delete process.env.ANTHROPIC_API_KEY;
+    fresh();
+  }
 
   // Other chats on this computer use another config, so an outside chat can't see them.
   stub.plan = ["ListAgents", {}];
@@ -372,6 +451,7 @@ function client(port) {
   check("no 10 Money, trash or nested text reached the outside stub", !reached(SECRET));
   check("no old transcript text reached it", !reached(/OLDCHATMARKER/));
   check("no git status or commit messages reached it", !reached(/gitstatusmarker|GITLOGMARKER/));
+  check("nothing from elsewhere on the computer reached it", !reached(/WIDEMARKER|root:x:0/));
   check("control: a local chat does get them", /GITLOGMARKER/.test(JSON.stringify(near.calls)));
   for (const m of marks) check(`no user config text reached it: ${m.slice(0, 40)}`, !has(m));
 
@@ -380,7 +460,8 @@ function client(port) {
   for (const s of [stub, near, anth]) s.server.close();
   // The temp vault's own transcript folder is the only thing a root run leaves in the real config.
   if (rootConfig && transcript && path.basename(path.dirname(transcript)).includes(path.basename(tmp))) fs.rmSync(path.dirname(transcript), { recursive: true, force: true });
-  fs.rmSync(tmp, { recursive: true, force: true });
+  // A closing chat can still be writing here.
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 500 });
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(2); });

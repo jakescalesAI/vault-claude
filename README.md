@@ -102,7 +102,9 @@ Supported: Anthropic API, OpenAI, Google Gemini, DeepSeek, xAI, OpenRouter, Groq
 
 **Outside chats start clean.** They get their own Claude Code folder (`~/.quartzi-copilot/outside-claude`), so your memory, hooks, extra folders and old chats stay out, and they load no settings or `CLAUDE.md` from the vault. They can't open `.trash`, `.git` or Obsidian's config folder, and they get no git status from the vault. Switching a chat to or from an outside provider starts a new conversation and says so, so earlier messages aren't sent. Moving between outside providers carries on.
 
-**Attachments** belong to one chat. Each chat gets its own folder and can only read that one, and the folder is cleared when the chat ends. After a chat has been idle for 15 minutes, its attachments are gone even if you carry on.
+**Modes:** outside chats run only in Edit or Read, because Plan and Auto can read files anywhere on your computer. The mode menu offers just those two, and a device that still asks for Plan or Auto gets Edit, and the chat says so.
+
+**Attachments** belong to one chat. Each chat gets its own folder and can only read that one, and the folder is cleared when the chat ends. That also happens when you change the mode, when a chat has been idle for 15 minutes, and when a fourth idle chat pushes out the oldest, so the earlier file is gone even if you carry on.
 
 A model that can't use tools still answers: the chat says it is running text only, and it can't read or change notes on that turn.
 

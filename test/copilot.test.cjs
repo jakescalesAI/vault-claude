@@ -247,6 +247,28 @@ const resultOf = (msgs) => { const r = msgs.find((m) => m.type === "event" && m.
     const r = await shellFor(msg);
     check(`${name}: shell stays, nothing said`, !r.off && !r.told && !r.asked, [r.off, r.told, r.asked]);
   }
+  // ---------- modes ----------
+  const modeOf = () => { const a = seen().at(-1).args; return a[a.indexOf("--permission-mode") + 1]; };
+  const outsiders = [["OpenAI", { provider: "openai", providerModel: "good-model" }], ["a custom endpoint", { provider: "custom-b", providerModel: "good-model" }]];
+  for (const [name, msg] of outsiders) {
+    for (const mode of ["plan", "auto"]) { await turn(c, Object.assign({ permissionMode: mode }, msg)); check(`${name} falls back to Edit from ${mode}`, modeOf() === "acceptEdits", modeOf()); }
+    await turn(c, Object.assign({ permissionMode: "default" }, msg));
+    check(`${name} keeps Read`, modeOf() === "default", modeOf());
+  }
+  for (const [name, msg] of [["LM Studio", { provider: "lmstudio", providerModel: "good-model" }], ["Anthropic API", { provider: "anthropic", providerModel: "claude-test", effort: "high" }], ["Claude login", { provider: "claude", model: "haiku", effort: "low" }]]) {
+    for (const mode of ["auto", "plan", "default", "acceptEdits"]) { await turn(c, Object.assign({ permissionMode: mode }, msg)); check(`${name} keeps ${mode}`, modeOf() === mode, modeOf()); }
+  }
+
+  // ---------- the desktop app's entry point ----------
+  process.env.CLAUDE_CODE_ENTRYPOINT = "claude-desktop";
+  for (const [name, msg] of [["OpenAI", { provider: "openai", providerModel: "good-model" }], ["LM Studio", { provider: "lmstudio", providerModel: "good-model" }], ["Anthropic API", { provider: "anthropic", providerModel: "claude-test", effort: "high" }]]) {
+    await turn(c, msg);
+    check(`${name} runs without it`, !("CLAUDE_CODE_ENTRYPOINT" in seen().at(-1).env), Object.keys(seen().at(-1).env));
+  }
+  await turn(c, { provider: "claude", model: "haiku", effort: "low" });
+  check("Claude login keeps it", seen().at(-1).env.CLAUDE_CODE_ENTRYPOINT === "claude-desktop");
+  delete process.env.CLAUDE_CODE_ENTRYPOINT;
+
   // ---------- outside chats carry none of the user's setup ----------
   process.env.CLAUDE_CODE_MESSAGING_SOCKET = "/tmp/fake-socket";
   process.env.CLAUDE_CODE_GIT_BASH_PATH = "C:\\Git\\bin\\bash.exe";
