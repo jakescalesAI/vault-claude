@@ -2,7 +2,7 @@
    On a desktop the plugin hosts Claude Code itself (see Host below) and other devices (iPad,
    phone) connect to it over Tailscale with a pairing code. The chat UI uses no Node APIs, so it
    runs on mobile. Styled after Apple's HIG; see styles.css. */
-const { addIcon, Plugin, ItemView, PluginSettingTab, Setting, MarkdownRenderer, MarkdownView, Platform, Notice } = require("obsidian");
+const { addIcon, normalizePath, Plugin, ItemView, PluginSettingTab, Setting, MarkdownRenderer, MarkdownView, Platform, Notice, requestUrl, TFile } = require("obsidian");
 
 const VIEW_TYPE = "vault-claude-view";
 const DEFAULT_SETTINGS = {
@@ -19,6 +19,7 @@ const DEFAULT_SETTINGS = {
   provider: "claude",
   providerModel: "",
   sendContext: true,
+  logPath: "0 Home/0 Quartzi Copilot/Build log.md", // outside the sorter and the scheduler
   sessions: [], // [{id, title, updated, pinned?, items: [...]}] newest first
 };
 const MODELS = [["fable", "Fable"], ["opus", "Opus"], ["sonnet", "Sonnet"], ["haiku", "Haiku"]];
@@ -55,6 +56,57 @@ function icon(parent, name, cls) {
   return span;
 }
 
+// Why a request to the host's /status failed. The words differ by platform, so the time it took
+// is the tie-break: a refusal comes back at once, silence takes a while.
+function probeFailure(message, ms) {
+  const m = String(message || "");
+  if (/offline|no route|unreachable|not connected to the internet|network connection was lost/i.test(m)) return { offline: true };
+  if (/refused|could not connect|err_connection_refused/i.test(m)) return { refused: true };
+  if (/timed? ?out/i.test(m)) return { timeout: true };
+  return ms < 1500 ? { refused: true } : { timeout: true };
+}
+
+// Which versions each end runs, and whether they differ.
+function versionsText(mine, host, hostAt) {
+  const seen = host === undefined ? "not reached yet" : !host ? "older than 0.9.0" : host + (hostAt ? ` (last seen ${whenText(hostAt)})` : "");
+  const line = `This device: ${mine}. Your computer: ${seen}.`;
+  return host !== undefined && host !== mine ? line + " The versions differ, so update the older one." : line;
+}
+
+// Names the reason this device can't use the host. probe is what /status said: {ok, version},
+// {refused}, {offline} or {timeout}. last is what the host reported the last time it was reached.
+function diagnose({ url, mobile, unpaired, probe, version, last }) {
+  const host = probe && probe.ok ? probe.version || "" : last ? last.version : undefined;
+  const at = probe && probe.ok ? 0 : last && last.at;
+  const end = (cause, title, why) => ({ cause, title, message: [why, versionsText(version, host, at)].filter(Boolean).join("\n\n") });
+  if (!url) return end("setup", "Not Set Up", "Add your computer's address and pairing code in Quartzi Copilot settings.");
+  if (mobile && /\/\/(127\.|localhost)/.test(url)) return end("loopback", "Wrong Address", `${url} only works on the computer itself. Use the address shown in Quartzi Copilot settings on your computer.`);
+  if (unpaired) return end("pairing", "Pairing Code Doesn't Match", "Your computer is reachable, but it rejected the pairing code. Copy the code from Quartzi Copilot settings on your computer and paste it here.");
+  const tailnet = /\/\/100\./.test(url);
+  if (probe && probe.ok) return end("socket", "Can't Open the Chat", `Quartzi Copilot is running on your computer, but this device couldn't open the chat connection to ${url}. Tap Retry. If it keeps failing, restart Obsidian on both.`);
+  if (probe && probe.refused) return end("closed", "Quartzi Copilot Isn't Running There", `Your computer answered at ${url}, but nothing is listening. Obsidian is closed on it, this vault isn't open, or Who can connect is set to This computer only.`);
+  if (probe && probe.offline) return end("offline", "This Device Isn't Connected", tailnet ? `This device has no route to ${url}. Open the Tailscale app here and turn it on.` : `This device has no route to ${url}. Check its network.`);
+  if (last && last.notOnTailscale) return end("no-tailscale", "Your Computer Isn't on Tailscale", `No answer from ${url}, and your computer said it wasn't on Tailscale the last time it was reached. Open Tailscale on it and connect.`);
+  return end("asleep", "Can't Reach Your Computer", `No answer from ${url}. Your laptop is probably asleep or off. Wake it and keep Obsidian open.` + (tailnet ? " If it's awake, check that Tailscale says Connected on it and on this device." : " If it's awake, check the address and that its firewall allows Obsidian."));
+}
+
+// Why the build log can't go at this path, or "" if it can.
+function logProblem(path) {
+  const parts = String(path || "").split("/").map((p) => p.trim().toLowerCase());
+  if (!/\.md$/i.test(path || "")) return "The build log has to be a note ending in .md.";
+  if (parts.includes("..") || parts.includes("")) return "The build log path isn't valid.";
+  if (parts.includes("10 money")) return "The build log can't live in 10 Money.";
+  return "";
+}
+
+// One plain bullet, never a checkbox: the scheduler books any checkbox it finds.
+function logLine(text, when, version, device) {
+  const clean = String(text).replace(/\s+/g, " ").replace(/^[-*+]\s+/, "").replace(/^\[[ xX]?\]\s*/, "").trim();
+  const pad = (n) => String(n).padStart(2, "0");
+  const stamp = `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())} ${pad(when.getHours())}:${pad(when.getMinutes())}`;
+  return `- ${stamp} · ${clean} · Copilot ${version}, ${device}`;
+}
+
 class VaultClaudeView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -86,7 +138,8 @@ class VaultClaudeView extends ItemView {
     const titles = header.createDiv("vc-titles");
     this.titleEl = titles.createDiv({ cls: "vc-title", text: "New Chat", attr: { role: "button", "aria-label": "Rename chat" } });
     this.titleEl.onclick = () => this.renameTitle();
-    const statusRow = titles.createDiv("vc-status-row");
+    const statusRow = titles.createDiv({ cls: "vc-status-row", attr: { role: "button", "aria-label": "Check connection" } });
+    statusRow.onclick = () => this.connectionAlert();
     this.statusDot = statusRow.createSpan("vc-dot");
     this.statusText = statusRow.createSpan({ cls: "vc-caption" });
     this.iconButton(header, "clock", "Chats", () => this.openHistory());
@@ -253,7 +306,7 @@ class VaultClaudeView extends ItemView {
       sel.value = value;
       sel.onchange = () => onChange(sel.value);
     };
-    const providers = this.providers || [];
+    const providers = this.readyProviders();
     const provider = providers.find((x) => x.id === s.provider);
     const redraw = () => { this.plugin.saveSettings(); this.updateBrain(); this.closeMenu(); this.openSettingsMenu(); };
     pick("Provider", [["claude", "Claude"], ...providers.map((x) => [x.id, x.name])], provider ? s.provider : "claude", (v) => {
@@ -263,7 +316,16 @@ class VaultClaudeView extends ItemView {
       redraw();
     });
     if (provider) {
-      pick("Model", provider.models.map((m) => [m, m.replace(/^models\//, "")]), s.providerModel, (v) => { s.providerModel = v; redraw(); });
+      const listed = provider.models.includes(s.providerModel);
+      const label = (m) => m.replace(/^models\//, "") + ((provider.noTools || []).includes(m) ? " · text only" : "");
+      if (provider.models.length) pick("Model", [...provider.models.map((m) => [m, label(m)]), ["", "Type a model…"]], listed ? s.providerModel : "", (v) => { s.providerModel = v; redraw(); });
+      if (!listed) {
+        if (!provider.models.length) menu.createDiv({ cls: "vc-menu-section", text: "Model" });
+        const typed = menu.createEl("input", { cls: "vc-model-input", attr: { type: "text", placeholder: "Type the model name", "aria-label": "Model name", autocapitalize: "off", spellcheck: "false" } });
+        typed.value = s.providerModel || "";
+        typed.onchange = () => { s.providerModel = typed.value.trim(); this.plugin.saveSettings(); this.updateBrain(); };
+      }
+      if (provider.kind === "anthropic") group("Effort", EFFORTS, "effort");
     } else {
       group("Model", MODELS, "model");
       group("Effort", EFFORTS, "effort");
@@ -358,19 +420,32 @@ class VaultClaudeView extends ItemView {
     }
   }
 
-  connectionAlert() {
-    const url = this.plugin.clientUrl();
-    const retry = { label: "Retry", primary: true, run: () => this.reconnect() };
-    const ok = { label: "OK" };
-    if (!url || this.state === "setup") return this.alert("Not Set Up", "Add your computer's address and pairing code in Quartzi Copilot settings.", [{ label: "OK", primary: true }]);
-    if (this.state === "unpaired" || this.lastFail === "unpaired") return this.alert("Pairing Code Doesn't Match", "Your computer is reachable, but it rejected the pairing code. Copy the code from Quartzi Copilot settings on your computer and paste it here.", [ok, retry]);
-    if (this.state === "connecting") return this.alert("Still Connecting", `Trying ${url}. Give it a few seconds, then send again.`, [ok, retry]);
-    const why = this.lastFail === "refused"
-      ? "Your computer answered but nothing is listening on that port. Check that Obsidian is open on it with this vault and that the address and port match its Quartzi Copilot settings."
-      : "No answer from your computer. Check that it's awake with Obsidian open, and that Windows Firewall allows Obsidian on private networks.";
-    this.alert("Can't Reach Your Computer", `${url}
+  // Asks the host's /status over plain HTTP, which still answers when the chat socket can't open.
+  async probeHost(url) {
+    const started = Date.now();
+    const ask = requestUrl({ url: url.replace(/^ws/, "http").replace(/\/+$/, "") + "/status", throw: false }).then((res) => {
+      let body = null;
+      try { body = JSON.parse(res.text); } catch (e) { /* a host older than 0.9.0 sends plain text */ }
+      return { ok: true, version: (body && body.version) || "" };
+    }).catch((e) => probeFailure(e && e.message, Date.now() - started));
+    return Promise.race([ask, new Promise((resolve) => window.setTimeout(() => resolve({ timeout: true }), 5000))]);
+  }
 
-${why}`, [ok, retry]);
+  // The connection as this device sees it right now, with both versions.
+  async connectionAlert() {
+    const retry = { label: "Retry", primary: true, run: () => this.reconnect() };
+    const version = this.plugin.manifest.version;
+    if (this.isReady()) {
+      const notes = this.hostWarnings || [];
+      this.alert(notes.length ? "Connected, With a Problem" : "Connected", [...notes, versionsText(version, this.hostVersion || "")].join("\n\n"), [{ label: "OK", primary: true }]);
+      return;
+    }
+    if (this.state === "connecting" && this.plugin.clientUrl()) return this.alert("Still Connecting", `Trying ${this.plugin.clientUrl()}. Give it a few seconds, then send again.`, [{ label: "OK" }, retry]);
+    const url = this.plugin.clientUrl();
+    const unpaired = this.state === "unpaired" || this.lastFail === "unpaired";
+    const probe = url && !unpaired ? await this.probeHost(url) : null;
+    const d = diagnose({ url, mobile: !Platform.isDesktopApp, unpaired, probe, version, last: this.plugin.lastHost() });
+    this.alert(d.title, d.message, d.cause === "setup" ? [{ label: "OK", primary: true }] : [{ label: "OK" }, retry]);
   }
 
   autosize() {
@@ -392,7 +467,7 @@ ${why}`, [ok, retry]);
     try { ws = new WebSocket(url); } catch (e) { this.setStatus("off"); return this.retry(); }
     this.ws = ws;
     const started = Date.now();
-    ws.onopen = () => { this.opened = true; ws.send(JSON.stringify({ type: "auth", token: this.plugin.settings.pairingCode })); };
+    ws.onopen = () => { this.opened = true; ws.send(JSON.stringify({ type: "auth", token: this.plugin.settings.pairingCode, version: this.plugin.manifest.version })); };
     ws.onmessage = (e) => { try { this.onServer(JSON.parse(e.data)); } catch (err) { console.error("vault-claude", err); } };
     ws.onclose = () => {
       if (this.ws !== ws) return;
@@ -427,7 +502,7 @@ ${why}`, [ok, retry]);
     this.statusDot.className = "vc-dot is-" + (state === "on" ? "on" : state === "connecting" ? "connecting" : "off");
     const local = this.plugin.hosting();
     this.statusText.setText({
-      on: local ? "Running on this computer" : `Connected to ${this.hostName || "your computer"}`,
+      on: (local ? "Running on this computer" : `Connected to ${this.hostName || "your computer"}`) + (local || this.hostVersion === this.plugin.manifest.version ? "" : ` · host ${this.hostVersion || "older"}, this device ${this.plugin.manifest.version}`),
       off: "Not connected",
       connecting: "Connecting…",
       unpaired: "Not paired · add the pairing code in settings",
@@ -669,6 +744,15 @@ ${why}`, [ok, retry]);
     const text = this.inputEl.value.trim();
     const attachments = this.pending || [];
     if (!text && !attachments.length) return;
+    // Written by this device, so it works with any model and with the host unreachable.
+    const log = /^\/log\s+([\s\S]+)/.exec(text);
+    if (log && !attachments.length) {
+      this.inputEl.value = "";
+      this.autosize();
+      this.updateSendButton();
+      this.plugin.appendLog(log[1]).then(() => this.toast("Added to the build log"), (e) => this.addItem({ kind: "error", text: e.message }));
+      return;
+    }
     if (!this.running && (!this.isReady())) {
       this.connectionAlert();
       return;
@@ -770,10 +854,24 @@ ${why}`, [ok, retry]);
   }
 
   // ---------- server events ----------
+  // Hosts before 0.9.0 send no version. Remembered per device, so a host that can't be reached can
+  // still be named by version.
+  onHostStatus(msg) {
+    this.hostVersion = msg.version || "";
+    this.hostWarnings = msg.warnings || [];
+    this.plugin.lastHost({ version: this.hostVersion, at: Date.now(), notOnTailscale: this.hostWarnings.some((w) => /isn't on Tailscale/.test(w)) });
+  }
+
+  // Providers that can be used now. Hosts before 0.9.0 only send those, with no set field.
+  readyProviders() {
+    return (this.providers || []).filter((x) => x.set !== false);
+  }
+
   onServer(msg) {
     if (msg.type === "hello") {
       this.vaultRoot = msg.vaultRoot || "";
       this.hostName = msg.host || "";
+      this.onHostStatus(msg);
       this.ws.send(JSON.stringify({ type: "models" }));
       this.ready = true;
       this.unpaired = false;
@@ -781,12 +879,14 @@ ${why}`, [ok, retry]);
       if (!this.running) this.flushQueue();
       return;
     }
+    if (msg.type === "status") { this.onHostStatus(msg); if (this.ready) this.setStatus("on"); return; }
+    if (msg.type === "warning") { this.addItem({ kind: "note", text: msg.message }); return; }
     if (msg.type === "transcript") { this.onTranscript(msg); return; }
     if (msg.type === "notice") { this.session.id = null; this.toast(msg.message.split(".")[0]); return; }
     if (msg.type === "models") {
       this.providers = msg.providers || [];
       const s = this.plugin.settings;
-      if (s.provider !== "claude" && !this.providers.some((x) => x.id === s.provider)) { s.provider = "claude"; this.plugin.saveSettings(); this.updateBrain(); }
+      if (s.provider !== "claude" && !this.readyProviders().some((x) => x.id === s.provider)) { s.provider = "claude"; this.plugin.saveSettings(); this.updateBrain(); }
       return;
     }
     if (msg.type === "error" && msg.code === "auth") { this.unpaired = true; this.setStatus("unpaired"); return; }
@@ -1269,6 +1369,8 @@ ${why}`, [ok, retry]);
       this.fillTool(el, item);
     } else if (item.kind === "error") {
       this.messagesEl.createDiv({ cls: "vc-error", text: item.text });
+    } else if (item.kind === "note") {
+      this.messagesEl.createDiv({ cls: "vc-note", text: item.text });
     }
     return ret;
   }
@@ -1433,10 +1535,12 @@ for line in sys.stdin:
 
 const PERMISSION_MODES = new Set(["auto", "acceptEdits", "plan", "default"]);
 const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
-// Providers Claude Code reaches through the local translator. "env" is an API key variable
-// already on this computer; keys typed in settings stay on this device, outside the synced vault.
+// Providers Claude Code reaches through the local translator, except kind "anthropic", which it
+// calls itself with an API key. "env" is the key's variable on the host. Keys live there or in the
+// OS keychain, never in data.json, which syncs. Custom endpoints are added per host in settings.
 const PROVIDERS = {
   claude: { name: "Claude" },
+  anthropic: { name: "Anthropic API", base: "https://api.anthropic.com", env: "ANTHROPIC_API_KEY", kind: "anthropic" },
   openai: { name: "OpenAI", base: "https://api.openai.com/v1", env: "OPENAI_API_KEY" },
   gemini: { name: "Google Gemini", base: "https://generativelanguage.googleapis.com/v1beta/openai", env: "GEMINI_API_KEY" },
   deepseek: { name: "DeepSeek", base: "https://api.deepseek.com/v1", env: "DEEPSEEK_API_KEY" },
@@ -1449,22 +1553,40 @@ const PROVIDERS = {
   together: { name: "Together AI", base: "https://api.together.xyz/v1", env: "TOGETHER_API_KEY" },
   ollama: { name: "Ollama (local)", base: "http://127.0.0.1:11434/v1", local: true },
   lmstudio: { name: "LM Studio (local)", base: "http://127.0.0.1:1234/v1", local: true },
-  custom: { name: "Custom" },
 };
+const MODEL_ID = /^\w[\w.\/:@~+-]*$/;
 
 // Not chat models, so never offered in the picker.
 const NOT_CHAT = /embed|tts|whisper|transcri|moderation|image|imagen|veo|lyria|banana|audio|realtime|live|robotics|aqa|dall-e|sora|rerank|computer-use|deep-research|antigravity/i;
 
-function upstream(cfg, path, body) {
+// Why a custom endpoint can't be used, or "" if it can. Keys never go in the address, and a key
+// variable has to look like one, so an endpoint can't be pointed at some other variable.
+function endpointProblem(c) {
+  if (!String(c.name || "").trim()) return "Give it a name.";
+  let url;
+  try { url = new URL(c.base); } catch (e) { return "Base URL isn't valid. Example: https://host/v1"; }
+  if (!/^https?:$/.test(url.protocol)) return "Base URL must start with http:// or https://";
+  if (url.username || url.password || url.search) return "Keep keys out of the base URL. Use a key variable.";
+  if (c.keyEnv && !/^[A-Za-z_]\w*$/.test(c.keyEnv)) return "Key variable can only hold letters, numbers and _.";
+  if (c.keyEnv && !/key|token|secret/i.test(c.keyEnv)) return "Key variable's name must contain KEY, TOKEN or SECRET.";
+  return "";
+}
+
+function hideKey(text, key) {
+  return key ? String(text).split(key).join("[key hidden]") : String(text);
+}
+
+function upstream(cfg, path, body, timeout) {
   const url = new URL(cfg.base + path);
   const lib = nodeRequire(url.protocol === "https:" ? "https" : "http");
   const headers = { "content-type": "application/json" };
-  if (cfg.key) headers.authorization = "Bearer " + cfg.key;
+  if (cfg.kind === "anthropic") { headers["x-api-key"] = cfg.key; headers["anthropic-version"] = "2023-06-01"; }
+  else if (cfg.key) headers.authorization = "Bearer " + cfg.key;
   const payload = body ? JSON.stringify(body) : null;
   return new Promise((resolve, reject) => {
     const req = lib.request(url, { method: body ? "POST" : "GET", headers }, resolve);
     req.on("error", reject);
-    req.setTimeout(cfg.local ? 300000 : 120000, () => req.destroy(new Error("The provider took too long to answer.")));
+    req.setTimeout(timeout || (cfg.local ? 300000 : 120000), () => req.destroy(new Error("The provider took too long to answer.")));
     req.end(payload);
   });
 }
@@ -1479,13 +1601,20 @@ function readAll(res) {
   });
 }
 
+// What the provider offers right now. ok is false when it has no list to give, so the model is
+// typed by hand. noTools holds models the list itself says can't call tools.
 async function listModels(cfg) {
   try {
-    const res = await upstream(cfg, "/models");
-    if (res.statusCode !== 200) { res.resume(); return []; }
-    const list = JSON.parse(await readAll(res)).data || [];
-    return list.map((m) => m.id).filter((id) => id && !NOT_CHAT.test(id)).sort();
-  } catch (e) { return []; }
+    const res = await upstream(cfg, cfg.kind === "anthropic" ? "/v1/models?limit=1000" : "/models", null, 8000);
+    if (res.statusCode !== 200) { res.resume(); return { ok: false, ids: [], noTools: [] }; }
+    const body = JSON.parse(await readAll(res));
+    const list = (Array.isArray(body) ? body : body.data || body.models || []).filter((m) => (m.id || m.name) && !NOT_CHAT.test(m.id || m.name));
+    return {
+      ok: true,
+      ids: list.map((m) => m.id || m.name).sort(),
+      noTools: list.filter((m) => Array.isArray(m.supported_parameters) && !m.supported_parameters.includes("tools")).map((m) => m.id || m.name),
+    };
+  } catch (e) { return { ok: false, ids: [], noTools: [] }; }
 }
 
 // Some providers reject JSON Schema keywords that Claude Code's tools use.
@@ -1499,16 +1628,19 @@ function cleanSchema(v) {
 
 // Anthropic Messages request -> OpenAI chat completions request. memo keeps what a provider must
 // see again on the next request (DeepSeek reasoning, Gemini thought signatures) by tool call id.
-function toOpenAI(body, cfg, memo) {
+// bare leaves tools out, for a model that can't call them: no tool list, and past tool steps
+// drop out of the history.
+function toOpenAI(body, cfg, memo, bare) {
   const messages = [];
   const textOf = (c) => (typeof c === "string" ? c : (c || []).filter((b) => b.type === "text").map((b) => b.text).join("\n"));
-  const system = textOf(body.system);
+  const system = [textOf(body.system), bare ? NO_TOOLS_PROMPT : ""].filter(Boolean).join("\n\n");
   if (system) messages.push({ role: "system", content: system });
   for (const m of body.messages || []) {
     const blocks = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content || [];
     if (m.role === "assistant") {
       const out = { role: "assistant", content: blocks.filter((b) => b.type === "text").map((b) => b.text).join("") || null };
-      const calls = blocks.filter((b) => b.type === "tool_use");
+      const calls = bare ? [] : blocks.filter((b) => b.type === "tool_use");
+      if (bare && !out.content) continue;
       if (calls.length) {
         out.tool_calls = calls.map((b) => {
           const call = { id: b.id, type: "function", function: { name: b.name, arguments: JSON.stringify(b.input || {}) } };
@@ -1522,7 +1654,7 @@ function toOpenAI(body, cfg, memo) {
       continue;
     }
     for (const b of blocks) {
-      if (b.type !== "tool_result") continue;
+      if (b.type !== "tool_result" || bare) continue;
       const text = typeof b.content === "string" ? b.content : (b.content || []).map((c) => (c.type === "text" ? c.text : "[" + c.type + " omitted]")).join("\n");
       messages.push({ role: "tool", tool_call_id: b.tool_use_id, content: (b.is_error ? "Error: " : "") + text });
     }
@@ -1535,7 +1667,7 @@ function toOpenAI(body, cfg, memo) {
   }
   const out = { model: body.model, messages, stream: !!body.stream };
   if (body.stream && !cfg.noUsage) out.stream_options = { include_usage: true };
-  if (body.tools && body.tools.length) {
+  if (body.tools && body.tools.length && !bare) {
     out.tools = body.tools.filter((t) => t.input_schema).map((t) => ({ type: "function", function: { name: t.name, description: t.description || "", parameters: cleanSchema(t.input_schema) } }));
     if (!out.tools.length) delete out.tools;
   }
@@ -1543,18 +1675,44 @@ function toOpenAI(body, cfg, memo) {
 }
 
 const STOP_REASONS = { tool_calls: "tool_use", length: "max_tokens", content_filter: "refusal" };
+const NO_TOOLS_PROMPT = "No tools are available in this chat: you can't read, search or change the vault. Never write tool calls. Answer from what the user tells you, and say so if you would need to see a note.";
+// How providers word "this model can't call tools".
+const TOOLS_REFUSED = /(tool|function)s?[ _-]?(call\w*|use|choice)?\b.{0,60}(not|un)[ -]?(supported|enabled|available)|(not|n't|unable to)\s.{0,30}support.{0,40}(tool|function)|enable-auto-tool-choice|no endpoints found.{0,40}tool/i;
 
-// Runs one request against the provider and answers in Anthropic's format.
-async function translateTurn(cfg, body, res, memo, fail) {
+async function providerError(cfg, up) {
+  const text = await readAll(up).catch(() => "");
+  let detail = text.slice(0, 500);
+  try { let j = JSON.parse(text); if (Array.isArray(j)) j = j[0]; detail = (j.error && (j.error.message || j.error)) || j.message || detail; } catch (e) { /* keep raw */ }
+  return hideKey(detail, cfg.key);
+}
+
+// A status Claude Code acts on itself would hide the provider's words behind its own login advice
+// or minutes of retries, so these go back as a plain failed request.
+function providerFailure(cfg, status, detail) {
+  if (status === 401 || status === 403) return [400, `${cfg.name} refused the key: ${detail}`];
+  return [status === 429 ? 429 : 400, `${cfg.name}: ${detail}`];
+}
+
+// Runs one request against the provider and answers in Anthropic's format. tools.has(model) says a
+// model is known not to call tools; tools.add(model) records one that turned out not to, and
+// tools.warn(model) tells the chat its turn is running without them.
+async function translateTurn(cfg, body, res, memo, fail, tools) {
+  const hadTools = !!(body.tools && body.tools.length);
+  let bare = hadTools && tools.has(body.model);
+  const ask = () => upstream(cfg, "/chat/completions", toOpenAI(body, cfg, memo, bare));
   let up;
-  try { up = await upstream(cfg, "/chat/completions", toOpenAI(body, cfg, memo)); }
-  catch (e) { return fail(502, `${cfg.name}: ${e.message}`); }
-  if (up.statusCode !== 200) {
-    const text = await readAll(up).catch(() => "");
-    let detail = text.slice(0, 500);
-    try { let j = JSON.parse(text); if (Array.isArray(j)) j = j[0]; detail = (j.error && j.error.message) || detail; } catch (e) { /* keep raw */ }
-    return fail(up.statusCode, `${cfg.name}: ${detail}`);
-  }
+  try {
+    up = await ask();
+    if (up.statusCode !== 200) {
+      const detail = await providerError(cfg, up);
+      if (bare || !hadTools || up.statusCode >= 500 || !TOOLS_REFUSED.test(detail)) return fail(...providerFailure(cfg, up.statusCode, detail));
+      tools.add(body.model);
+      bare = true;
+      up = await ask();
+      if (up.statusCode !== 200) return fail(...providerFailure(cfg, up.statusCode, await providerError(cfg, up)));
+    }
+  } catch (e) { return fail(400, `Couldn't reach ${cfg.name}: ${hideKey(e.message, cfg.key)}`); }
+  if (bare) tools.warn(body.model);
   const id = "msg_" + Date.now().toString(36);
   const remember = (call, reasoning) => {
     if (!call.extra && !reasoning) return;
@@ -1638,6 +1796,7 @@ async function translateTurn(cfg, body, res, memo, fail) {
 }
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const LOGIN_NEEDED = /not logged in|please run \/login|invalid api key|oauth token (has )?(expired|revoked)/i;
 
 function nodeRequire(name) {
   // eslint-disable-next-line no-undef
@@ -1791,7 +1950,6 @@ class Host {
   }
 
   async start() {
-    const http = nodeRequire("http");
     const path = nodeRequire("path");
     const os = nodeRequire("os");
     const fs = nodeRequire("fs");
@@ -1810,29 +1968,81 @@ class Host {
         else this.log("No Tailscale address found; only this computer can connect.");
       }
     }
-    for (const h of hosts) {
-      const server = http.createServer((req, res) => {
-        res.writeHead(200, { "Content-Type": "text/plain" });
-        res.end("Quartzi Copilot host. Connect from the Obsidian plugin.\n");
-      });
-      server.on("upgrade", (req, socket) => this.upgrade(req, socket));
-      await new Promise((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(this.config.port, h, resolve);
-      });
-      server.on("error", (e) => this.log("Server error: " + e.message));
-      this.servers.push(server);
-      this.addresses.push(h);
+    for (const h of hosts) await this.listenOn(h);
+    // Tailscale often comes up after the host does (a restart, waking from sleep).
+    if (this.config.bind === "tailscale") {
+      this.tailscaleTimer = setInterval(() => this.joinTailscale(), 30000);
+      if (this.tailscaleTimer.unref) this.tailscaleTimer.unref();
     }
     this.chats = new Set();
     await this.startTranslator();
+    this.checkLogin();
     if (!this.config.transcribeCommand) setTimeout(() => this.whisper(), 2000);
     setTimeout(() => this.ensureSpare(this.signature({})), 1000);
     this.log(`Hosting on ${this.addresses.map((h) => h + ":" + this.config.port).join(", ")} with ${this.claude}`);
   }
 
+  async listenOn(address) {
+    const server = nodeRequire("http").createServer((req, res) => {
+      // Lets a device tell "Copilot is up but the chat socket failed" from "nothing is listening".
+      if (req.url === "/status") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ app: "quartzi-copilot", version: this.config.version || "" }));
+      }
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("Quartzi Copilot host. Connect from the Obsidian plugin.\n");
+    });
+    server.on("upgrade", (req, socket) => this.upgrade(req, socket));
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(this.config.port, address, resolve);
+    });
+    server.on("error", (e) => this.log("Server error: " + e.message));
+    this.servers.push(server);
+    this.addresses.push(address);
+  }
+
+  async joinTailscale() {
+    const ts = tailscaleIp();
+    if (this.stopped || !ts || this.addresses.includes(ts)) return;
+    try {
+      await this.listenOn(ts);
+      this.log("Tailscale is up; now also listening on " + ts);
+      this.broadcastStatus();
+    } catch (e) { this.log("Couldn't listen on Tailscale: " + e.message); }
+  }
+
+  // Asks Claude Code whether it's signed in. Stays null if this version can't say.
+  checkLogin() {
+    nodeRequire("child_process").execFile(this.claude, ["auth", "status", "--json"], { env: this.childEnv(), timeout: 15000, windowsHide: true }, (err, stdout) => {
+      let was = this.loggedIn, now = null;
+      try { now = JSON.parse(stdout).loggedIn === true; } catch (e) { /* older Claude Code */ }
+      this.loggedIn = now;
+      if (now !== was) this.broadcastStatus();
+    });
+  }
+
+  // What stops this host working for other devices, in plain words.
+  warnings() {
+    const out = [];
+    const name = nodeRequire("os").hostname();
+    if (this.loggedIn === false) out.push(`Claude Code isn't logged in on ${name}. Open a terminal there, run claude, then /login.`);
+    if (this.config.bind === "local") out.push(`Who can connect is set to This computer only, so your phone and iPad can't reach ${name}.`);
+    else if (this.config.bind === "tailscale" && !this.addresses.some((a) => a.startsWith("100."))) out.push(`${name} isn't on Tailscale right now, so your phone and iPad can't reach it. Open Tailscale there and connect.`);
+    return out;
+  }
+
+  statusMessage() {
+    return { version: this.config.version || "", loggedIn: this.loggedIn === undefined ? null : this.loggedIn, warnings: this.warnings() };
+  }
+
+  broadcastStatus() {
+    for (const c of this.conns || []) if (c.authed) c.send(Object.assign({ type: "status" }, this.statusMessage()));
+  }
+
   stop() {
     this.stopped = true;
+    clearInterval(this.tailscaleTimer);
     if (this.translator) { this.translator.close(); this.translator = null; }
     for (const c of this.chats || []) this.kill(c);
     if (this.spare) this.kill(this.spare);
@@ -1873,9 +2083,11 @@ class Host {
       if (!authed) {
         if (msg.type === "auth" && sameToken(msg.token, this.config.token)) {
           authed = true;
+          ws.authed = true;
           clearTimeout(authTimer);
-          ws.send({ type: "hello", vault: nodeRequire("path").basename(this.config.vaultPath), vaultRoot: this.config.vaultPath, host: nodeRequire("os").hostname() });
-          this.log("Paired device connected: " + peer);
+          ws.send(Object.assign({ type: "hello", vault: nodeRequire("path").basename(this.config.vaultPath), vaultRoot: this.config.vaultPath, host: nodeRequire("os").hostname() }, this.statusMessage()));
+          this.log(`Paired device connected: ${peer}${msg.version ? " (plugin " + msg.version + ")" : ""}`);
+          this.checkLogin();
         } else {
           ws.send({ type: "error", code: "auth", message: "This device isn't paired. Paste the pairing code from the host computer in Quartzi Copilot settings." });
           ws.close();
@@ -1936,30 +2148,79 @@ class Host {
   }
 
   // ---------- other providers ----------
-  providerConfig(id) {
-    const p = PROVIDERS[id];
-    if (!p || id === "claude") return null;
-    const saved = (this.config.getKey && this.config.getKey(id)) || "";
-    const key = saved || (p.env && process.env[p.env]) || "";
-    const base = id === "custom" ? (this.config.getKey && this.config.getKey("custom-url")) || "" : p.base;
-    if (!base || (!key && !p.local && id !== "custom")) return null;
-    return { name: p.name, base: base.replace(/\/+$/, ""), key, noUsage: p.noUsage, local: p.local };
+  providerDef(id) {
+    if (PROVIDERS[id]) return PROVIDERS[id];
+    const c = this.customs().find((x) => x.id === id);
+    return c ? { name: c.name, base: c.base, env: c.keyEnv, models: c.models || [], custom: true, noUsage: true } : null;
   }
 
-  // Only providers that are set up, with the models each says it has right now.
+  customs() {
+    return ((this.config.getCustom && this.config.getCustom()) || []).filter((c) => /^[\w-]+$/.test(c.id) && !endpointProblem(c));
+  }
+
+  providerIds() {
+    return Object.keys(PROVIDERS).concat(this.customs().map((c) => c.id));
+  }
+
+  // The keychain copy first, then the host's environment. Nothing here leaves this process except
+  // in the request to that provider.
+  keyFor(id) {
+    const p = this.providerDef(id);
+    return (this.config.getKey && this.config.getKey(id)) || (p && p.env && process.env[p.env]) || "";
+  }
+
+  keySource(id) {
+    const p = this.providerDef(id);
+    const saved = this.config.keySource && this.config.keySource(id);
+    return saved || (p && p.env && process.env[p.env] ? "environment" : "");
+  }
+
+  providerConfig(id) {
+    const p = this.providerDef(id);
+    if (!p || id === "claude") return null;
+    const key = this.keyFor(id);
+    if (!p.base || (!key && !p.local && !(p.custom && !p.env))) return null;
+    return { id, name: p.name, base: p.base.replace(/\/+$/, ""), key, noUsage: p.noUsage, local: p.local, kind: p.kind };
+  }
+
+  // Every provider with whether it's set up (never its key) and, when it is, the models it says it
+  // has right now. hand means it gave no list, so the model is typed by hand.
   async listProviders() {
-    const out = [];
-    await Promise.all(Object.keys(PROVIDERS).map(async (id, i) => {
+    const rows = await Promise.all(this.providerIds().filter((id) => id !== "claude").map(async (id) => {
+      const p = this.providerDef(id);
       const cfg = this.providerConfig(id);
-      if (!cfg) return;
-      const models = await listModels(cfg);
-      if (models.length) out[i] = { id, name: cfg.name, models };
+      const row = { id, name: p.name, kind: p.kind || "openai", local: !!p.local, env: p.env || "", set: !!cfg, source: cfg ? this.keySource(id) : "", models: [], noTools: [], hand: false };
+      if (!cfg) return row;
+      const live = await listModels(cfg);
+      if (p.local && !live.ok) row.set = false; // not running right now
+      row.models = [...new Set([...(p.models || []), ...live.ids])];
+      row.noTools = live.noTools;
+      row.hand = !row.models.length;
+      for (const m of live.noTools) this.toolless.add(id + "|" + m);
+      return row;
     }));
-    return out.filter(Boolean);
+    return rows;
+  }
+
+  // Provider keys stay out of Claude Code's environment, so a tool step can't print them. The one
+  // exception is ANTHROPIC_API_KEY: Claude Code itself reads that one.
+  childEnv() {
+    const env = Object.assign({}, process.env);
+    for (const id of this.providerIds()) {
+      const v = this.providerDef(id).env;
+      if (v && v !== "ANTHROPIC_API_KEY") delete env[v];
+    }
+    return env;
   }
 
   providerEnv(provider, model) {
-    return Object.assign({}, process.env, {
+    const cfg = this.providerConfig(provider);
+    if (cfg.kind === "anthropic") {
+      const env = this.childEnv();
+      delete env.ANTHROPIC_AUTH_TOKEN;
+      return Object.assign(env, { ANTHROPIC_API_KEY: cfg.key, ANTHROPIC_BASE_URL: cfg.base });
+    }
+    return Object.assign(this.childEnv(), {
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${this.translatorPort}/p/${provider}`,
       ANTHROPIC_AUTH_TOKEN: this.translatorToken,
       ANTHROPIC_API_KEY: "",
@@ -1973,8 +2234,19 @@ class Host {
     });
   }
 
+  // Tells a chat once that this model is running without tools.
+  warnToolless(provider, model) {
+    for (const c of this.chats) {
+      const [, m, , p] = c.sig.split("|");
+      if (m !== model || p !== provider || !c.turn || c.warnedToolless) continue;
+      c.warnedToolless = true;
+      c.turn.ws.send({ type: "warning", message: `${model} can't use tools, so this chat is text only: it can't read, search or edit your notes. Pick another model to work on the vault.` });
+    }
+  }
+
   async startTranslator() {
     this.translatorToken = nodeRequire("crypto").randomBytes(24).toString("hex");
+    this.toolless = new Set(); // provider|model pairs that can't call tools
     const memo = new Map();
     this.translator = nodeRequire("http").createServer((req, res) => {
       const m = /^\/p\/([\w-]+)\/v1\/messages(\/count_tokens)?/.exec(req.url);
@@ -1982,7 +2254,7 @@ class Host {
       const fail = (code, message) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify({ type: "error", error: { type: "api_error", message } })); };
       if (!m || auth !== this.translatorToken) return fail(404, "Not found");
       const cfg = this.providerConfig(m[1]);
-      if (!cfg) return fail(401, "That provider isn't set up.");
+      if (!cfg) return fail(400, "That provider isn't set up.");
       let raw = "";
       req.setEncoding("utf8");
       req.on("data", (d) => { raw += d; });
@@ -1990,7 +2262,11 @@ class Host {
         let body;
         try { body = JSON.parse(raw); } catch (e) { return fail(400, "Bad JSON"); }
         if (m[2]) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ input_tokens: Math.ceil(raw.length / 4) })); }
-        translateTurn(cfg, body, res, memo, fail);
+        translateTurn(cfg, body, res, memo, fail, {
+          has: (model) => this.toolless.has(m[1] + "|" + model),
+          add: (model) => this.toolless.add(m[1] + "|" + model),
+          warn: (model) => this.warnToolless(m[1], model),
+        });
       });
     });
     await new Promise((resolve, reject) => {
@@ -2006,11 +2282,16 @@ class Host {
   // new chat. Changing mode, model or effort starts a new process that resumes the same chat.
   signature(msg) {
     const mode = PERMISSION_MODES.has(msg.permissionMode) ? msg.permissionMode : "acceptEdits";
-    const provider = PROVIDERS[msg.provider] ? msg.provider : "claude";
-    if (provider !== "claude" && msg.providerModel && /^[\w.\/:@-]+$/.test(msg.providerModel)) return [mode, msg.providerModel, "medium", provider].join("|");
-    const model = msg.model && /^[\w.-]+$/.test(msg.model) ? msg.model : DEFAULT_SETTINGS.model;
+    const provider = this.providerDef(msg.provider) ? msg.provider : "claude";
     const effort = EFFORT_LEVELS.has(msg.effort) ? msg.effort : DEFAULT_SETTINGS.effort;
+    if (provider !== "claude") return [mode, MODEL_ID.test(msg.providerModel || "") ? msg.providerModel : "", effort, provider].join("|");
+    const model = msg.model && /^[\w.-]+$/.test(msg.model) ? msg.model : DEFAULT_SETTINGS.model;
     return [mode, model, effort].join("|");
+  }
+
+  systemPrompt() {
+    const log = this.config.logPath;
+    return log ? `${SYSTEM_PROMPT}\nWhen the user asks you to log a build or a publish, add one plain bullet (never a checkbox) with the date to the note ${log}.` : SYSTEM_PROMPT;
   }
 
   spawnClaude(sig, resume) {
@@ -2021,14 +2302,15 @@ class Host {
     const attachRoot = path.join(this.tmp, "attachments");
     fs.mkdirSync(attachRoot, { recursive: true });
     const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-      "--include-partial-messages", "--append-system-prompt", SYSTEM_PROMPT, "--add-dir", attachRoot,
+      "--include-partial-messages", "--append-system-prompt", this.systemPrompt(), "--add-dir", attachRoot,
       "--permission-mode", mode, "--model", model];
     // Other providers run through the local translator with Claude Code's built-in tools.
     // MCP servers stay off there: their hundreds of tools exceed what those APIs accept.
-    if (provider) args.push("--strict-mcp-config");
+    const translated = provider && this.providerDef(provider).kind !== "anthropic";
+    if (translated) args.push("--strict-mcp-config");
     else args.push("--effort", effort);
     if (resume) args.push("--resume", resume);
-    const proc = cp.spawn(this.claude, args, { cwd: this.config.vaultPath, env: provider ? this.providerEnv(provider, model) : process.env, windowsHide: true });
+    const proc = cp.spawn(this.claude, args, { cwd: this.config.vaultPath, env: provider ? this.providerEnv(provider, model) : this.childEnv(), windowsHide: true });
     const c = { proc, sig, resumed: resume, sessionId: resume, turn: null, buf: "", stderr: "", dead: false, idleTimer: null };
     this.chats.add(c);
     proc.stdout.setEncoding("utf8");
@@ -2050,6 +2332,7 @@ class Host {
           continue;
         }
         if (event.type !== "system") c.turn.events++;
+        if (event.type === "result" && event.is_error && event.result) event.result = this.plainError(c, event.result);
         c.turn.ws.send({ type: "event", event });
         if (event.type === "result") this.finishTurn(c, event.is_error ? 1 : 0);
       }
@@ -2074,12 +2357,23 @@ class Host {
         return;
       }
       const err = startError || c.stderr.replace(/\S+ hook \[[\s\S]*?\] failed: Hook cancelled\s*/g, "").trim();
-      if (!c.interrupted && err) t.ws.send({ type: "error", message: err.slice(-2000) });
+      if (!c.interrupted && err) t.ws.send({ type: "error", message: this.plainError(c, err).slice(-2000) });
       t.ws.send({ type: "done", sessionId: c.sessionId, code: c.interrupted ? 0 : (code || 1) });
     };
     proc.on("error", (e) => ended(-1, "Couldn't start Claude Code: " + e.message));
     proc.on("close", (code) => ended(code));
     return c;
+  }
+
+  // Claude Code's own wording for "sign in" means nothing on a phone, and a provider's error can
+  // quote the key it refused.
+  plainError(c, text) {
+    const pid = c.sig.split("|")[3];
+    if (!pid && LOGIN_NEEDED.test(text)) {
+      this.loggedIn = false;
+      return `Claude Code isn't logged in on ${nodeRequire("os").hostname()}. Open a terminal there, run claude, then /login.`;
+    }
+    return pid ? hideKey(text, this.keyFor(pid)) : String(text);
   }
 
   finishTurn(c, code) {
@@ -2110,8 +2404,10 @@ class Host {
   runTurn(ws, msg, saved) {
     if (!saved) saved = this.saveAttachments(msg.attachments);
     const sig = this.signature(msg);
-    const pid = sig.split("|")[3];
-    if (pid && !this.providerConfig(pid)) { ws.send({ type: "error", message: `${PROVIDERS[pid].name} isn't set up. Add its key in Quartzi Copilot settings on your computer.` }); ws.send({ type: "done" }); return null; }
+    const [, sigModel, , pid] = sig.split("|");
+    const refuse = (message) => { ws.send({ type: "error", message }); ws.send({ type: "done" }); return null; };
+    if (pid && !this.providerConfig(pid)) return refuse(`${this.providerDef(pid).name} isn't set up. Add its key in Quartzi Copilot settings on your computer.`);
+    if (pid && !sigModel) return refuse(`Choose a model for ${this.providerDef(pid).name} in the brain menu.`);
     const sid = msg.sessionId && /^[\w-]+$/.test(msg.sessionId) ? msg.sessionId : null;
     let c = null;
     if (sid) {
@@ -2233,7 +2529,7 @@ class VaultClaudeSettings extends PluginSettingTab {
         : plugin.hostError || (plugin.hostEnabled() ? "Starting…" : "Off. This device connects to another computer instead.");
       new Setting(containerEl)
         .setName("Run Claude Code on this computer")
-        .setDesc(status)
+        .setDesc([status, ...(plugin.hosting() ? plugin.host.warnings() : [])].join(" "))
         .addToggle((t) => t.setValue(plugin.hostEnabled()).onChange(async (on) => {
           plugin.setHostEnabled(on);
           if (on) await plugin.startHost(); else plugin.stopHost();
@@ -2308,26 +2604,8 @@ class VaultClaudeSettings extends PluginSettingTab {
         .addDropdown((d) => d.addOption("beside", "Beside the note").addOption("sidebar", "In the sidebar").setValue(s.placement || "beside")
           .onChange(async (v) => { s.placement = v; await plugin.saveSettings(); plugin.app.workspace.detachLeavesOfType(VIEW_TYPE); await plugin.activate(); }));
     }
-    if (Platform.isDesktopApp && plugin.hostEnabled()) {
-      new Setting(containerEl).setName("Model providers").setHeading();
-      containerEl.createDiv({ cls: "setting-item-description vc-settings-note", text: "Claude uses your Claude login. Other providers appear in the brain menu once they have a key. Keys stay on this computer and never sync. Those chats use the built-in file and shell tools, without your MCP servers." });
-      const refresh = () => plugin.views().forEach((v) => { if (v.isReady()) v.ws.send(JSON.stringify({ type: "models" })); });
-      for (const id of Object.keys(PROVIDERS)) {
-        const p = PROVIDERS[id];
-        if (id === "claude" || p.local) continue;
-        if (id === "custom") {
-          new Setting(containerEl).setName("Custom address").setDesc("Any OpenAI-compatible API, for example https://host/v1.")
-            .addText((t) => t.setPlaceholder("https://host/v1").setValue(plugin.local("provider-custom-url") || "").onChange((v) => { plugin.local("provider-custom-url", v.trim()); refresh(); }));
-        }
-        const fromEnv = p.env && process.env[p.env];
-        new Setting(containerEl).setName(id === "custom" ? "Custom key" : p.name)
-          .addText((t) => {
-            t.inputEl.type = "password";
-            t.setPlaceholder(fromEnv ? `Using ${p.env}` : "API key").setValue(plugin.local("provider-" + id) || "").onChange((v) => { plugin.local("provider-" + id, v.trim()); refresh(); });
-          });
-      }
-      containerEl.createDiv({ cls: "setting-item-description vc-settings-note", text: "Ollama and LM Studio appear on their own while they are running on this computer." });
-    }
+    if (Platform.isDesktopApp && plugin.hostEnabled()) this.providerSettings(containerEl);
+    else this.providerStatus(containerEl);
     new Setting(containerEl).setName(Platform.isDesktopApp ? "Connect to another computer" : "Connect to your computer").setHeading();
     if (Platform.isDesktopApp && plugin.hostEnabled()) {
       containerEl.createDiv({ cls: "setting-item-description vc-settings-note", text: "This computer runs Claude Code itself, so it doesn't use these. They are what your other devices use." });
@@ -2347,6 +2625,87 @@ class VaultClaudeSettings extends PluginSettingTab {
         await plugin.saveSettings();
       }))
       .addButton((b) => b.setButtonText("Reconnect").onClick(() => plugin.views().forEach((v) => v.reconnect())));
+
+    new Setting(containerEl).setName("Connection").setHeading();
+    new Setting(containerEl)
+      .setName("Check connection")
+      .setDesc(`This device runs ${plugin.manifest.version}.`)
+      .addButton((b) => b.setButtonText("Check").onClick(async () => {
+        const view = plugin.views()[0] || await plugin.activate();
+        if (view) view.connectionAlert();
+      }));
+    new Setting(containerEl).setName("Build log").setHeading();
+    new Setting(containerEl)
+      .setName("Note")
+      .setDesc(logProblem(s.logPath) || "Type /log and a line in the chat to add to it, on any device and with any model.")
+      .addText((t) => t.setValue(s.logPath).onChange(async (v) => {
+        s.logPath = v.trim();
+        await plugin.saveSettings();
+        if (plugin.host) plugin.host.config.logPath = logProblem(s.logPath) ? "" : s.logPath;
+      }));
+  }
+
+  // On the host: where each key comes from, never its value. The box is always empty.
+  providerSettings(containerEl) {
+    const plugin = this.plugin;
+    const refresh = () => plugin.views().forEach((v) => { if (v.isReady()) v.ws.send(JSON.stringify({ type: "models" })); });
+    const secure = !!plugin.keychain();
+    new Setting(containerEl).setName("Model providers").setHeading();
+    containerEl.createDiv({ cls: "setting-item-description vc-settings-note", text: "Claude uses your Claude login. Other providers appear in the brain menu once they have a key. Keys stay on this computer and never sync. Those chats use the built-in file and shell tools, without your MCP servers." });
+    const keyRow = (row, id, env) => {
+      const saved = plugin.keySource(id);
+      const state = saved === "keychain" ? "Set, in this computer's keychain."
+        : saved === "plain" ? `Set, but not encrypted on this computer. Move it to the ${env || "keychain"}.`
+        : env && process.env[env] ? `Set, from ${env}.` : "Not set.";
+      row.setDesc(secure || !env ? state : `${state}${state === "Not set." ? ` Set ${env} on this computer and restart Obsidian.` : ""}`);
+      if (secure) {
+        let typed = "";
+        row.addText((t) => { t.inputEl.type = "password"; t.setPlaceholder("Paste a key").onChange((v) => { typed = v.trim(); }); });
+        row.addButton((b) => b.setButtonText("Save").onClick(() => { if (typed) { plugin.setKey(id, typed); refresh(); this.display(); } }));
+      }
+      if (saved) row.addButton((b) => b.setButtonText("Clear").setWarning().onClick(() => { plugin.setKey(id, ""); refresh(); this.display(); }));
+    };
+    for (const id of Object.keys(PROVIDERS)) {
+      const p = PROVIDERS[id];
+      if (id === "claude" || p.local) continue;
+      keyRow(new Setting(containerEl).setName(p.name), id, p.env);
+    }
+    containerEl.createDiv({ cls: "setting-item-description vc-settings-note", text: "Ollama and LM Studio appear on their own while they are running on this computer." });
+
+    new Setting(containerEl).setName("Custom endpoints").setHeading();
+    containerEl.createDiv({ cls: "setting-item-description vc-settings-note", text: "Any OpenAI-compatible API. Models it doesn't list go in Model list, separated by commas." });
+    const list = plugin.customs();
+    let refreshTimer = null;
+    const save = () => { plugin.saveCustoms(list); clearTimeout(refreshTimer); refreshTimer = window.setTimeout(refresh, 800); };
+    list.forEach((c) => {
+      const problem = endpointProblem(c);
+      new Setting(containerEl).setName(c.name || "New endpoint").setDesc(problem).setHeading()
+        .addButton((b) => b.setButtonText("Remove").setWarning().onClick(() => {
+          plugin.setKey(c.id, "");
+          list.splice(list.indexOf(c), 1);
+          save();
+          this.display();
+        }));
+      const field = (name, key, hint, parse) => new Setting(containerEl).setName(name).addText((t) => t.setPlaceholder(hint).setValue(key === "models" ? (c.models || []).join(", ") : c[key] || "").onChange((v) => { c[key] = parse ? parse(v) : v.trim(); save(); }));
+      field("Name", "name", "My server");
+      field("Base URL", "base", "https://host/v1");
+      field("Key variable", "keyEnv", "MY_API_KEY");
+      field("Model list", "models", "model-a, model-b", (v) => v.split(",").map((m) => m.trim()).filter((m) => MODEL_ID.test(m)));
+      keyRow(new Setting(containerEl).setName("Key"), c.id, c.keyEnv);
+    });
+    new Setting(containerEl).addButton((b) => b.setButtonText("Add endpoint").onClick(() => {
+      list.push({ id: "custom-" + Date.now().toString(36), name: "", base: "", keyEnv: "", models: [] });
+      save();
+      this.display();
+    }));
+  }
+
+  // On other devices: what the host says is ready. Keys can't be set from here.
+  providerStatus(containerEl) {
+    const view = this.plugin.views().find((v) => v.isReady());
+    if (!view || !view.providers) return;
+    new Setting(containerEl).setName("Model providers").setHeading();
+    for (const p of view.providers) new Setting(containerEl).setName(p.name).setDesc(p.set === false ? "Not set" : "Set");
   }
 }
 
@@ -2369,6 +2728,14 @@ module.exports = class VaultClaudePlugin extends Plugin {
       editorCallback: async (editor) => {
         const view = await this.activate();
         if (view && editor.getSelection()) { view.inputEl.value = "About the selected text: "; view.inputEl.focus(); }
+      },
+    });
+    this.addCommand({
+      id: "add-to-build-log",
+      name: "Add to build log",
+      callback: async () => {
+        const view = await this.activate();
+        if (view) { view.inputEl.value = "/log "; view.inputEl.focus(); view.updateSendButton(); }
       },
     });
     this.addSettingTab(new VaultClaudeSettings(this.app, this));
@@ -2401,6 +2768,81 @@ module.exports = class VaultClaudePlugin extends Plugin {
     window.localStorage.setItem(scoped, value);
   }
 
+  // What this device last heard from the host, for naming it when it can't be reached.
+  lastHost(value) {
+    if (value) return this.local("last-host", JSON.stringify(value));
+    try { return JSON.parse(this.local("last-host")) || null; } catch (e) { return null; }
+  }
+
+  // ---------- keys (host only) ----------
+  // Electron's safeStorage encrypts with the OS keychain (DPAPI on Windows). The encrypted copy
+  // sits in this device's local storage, which doesn't sync. No keychain means no saved keys.
+  keychain() {
+    if (!Platform.isDesktopApp) return null;
+    try {
+      const electron = nodeRequire("electron");
+      const store = electron.safeStorage || (electron.remote && electron.remote.safeStorage);
+      return store && store.isEncryptionAvailable() ? store : null;
+    } catch (e) { return null; }
+  }
+
+  getKey(id) {
+    const sealed = this.local("key-" + id);
+    const store = sealed && this.keychain();
+    if (store) { try { return store.decryptString(Buffer.from(sealed, "base64")); } catch (e) { return ""; } }
+    return this.local("provider-" + id) || ""; // 0.8.0 kept these unencrypted
+  }
+
+  setKey(id, value) {
+    const store = this.keychain();
+    this.local("provider-" + id, "");
+    this.local("key-" + id, value && store ? Buffer.from(store.encryptString(value)).toString("base64") : "");
+  }
+
+  keySource(id) {
+    if (this.local("key-" + id)) return "keychain";
+    return this.local("provider-" + id) ? "plain" : "";
+  }
+
+  // 0.8.0 kept one custom address and plain keys. Moves them where 0.9.0 reads them.
+  migrateKeys() {
+    const url = this.local("provider-custom-url");
+    if (url) {
+      const list = this.customs();
+      if (!list.some((c) => c.id === "custom")) this.saveCustoms(list.concat({ id: "custom", name: "Custom", base: url, keyEnv: "", models: [] }));
+      this.local("provider-custom-url", "");
+    }
+    if (!this.keychain()) return;
+    for (const id of [...Object.keys(PROVIDERS), ...this.customs().map((c) => c.id)]) {
+      const plain = this.local("provider-" + id);
+      if (plain) this.setKey(id, plain);
+    }
+  }
+
+  // Custom endpoints are this host's own: synced settings can't point a key at a new address.
+  customs() {
+    try { return JSON.parse(this.local("custom-endpoints")) || []; } catch (e) { return []; }
+  }
+
+  saveCustoms(list) {
+    this.local("custom-endpoints", JSON.stringify(list));
+  }
+
+  // ---------- build log ----------
+  async appendLog(text) {
+    const path = normalizePath(this.settings.logPath || DEFAULT_SETTINGS.logPath);
+    const problem = logProblem(path);
+    if (problem) throw new Error(problem);
+    const device = Platform.isDesktopApp ? "computer" : Platform.isTablet ? "iPad" : "phone";
+    const line = logLine(text, new Date(), this.manifest.version, device);
+    const { vault } = this.app;
+    const file = vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) return vault.process(file, (data) => data.replace(/\s*$/, "\n") + line + "\n");
+    const folder = path.split("/").slice(0, -1).join("/");
+    if (folder && !vault.getAbstractFileByPath(folder)) await vault.createFolder(folder);
+    return vault.create(path, `# Build log\n\n${line}\n`);
+  }
+
   hosting() {
     return !!(this.host && this.host.servers.length);
   }
@@ -2416,13 +2858,18 @@ module.exports = class VaultClaudePlugin extends Plugin {
     this.stopHost();
     const s = this.settings;
     if (!s.pairingCode) { s.pairingCode = newPairingCode(); await this.saveSettings(); }
+    this.migrateKeys();
     const adapter = this.app.vault.adapter;
     const port = Number(s.hostPort) || 8787;
     const host = new Host({
       vaultPath: typeof adapter.getBasePath === "function" ? adapter.getBasePath() : "",
       port,
       bind: s.hostBind,
-      getKey: (id) => this.local("provider-" + id) || "",
+      getKey: (id) => this.getKey(id),
+      keySource: (id) => this.keySource(id),
+      getCustom: () => this.customs(),
+      version: this.manifest.version,
+      logPath: logProblem(s.logPath) ? "" : s.logPath,
       token: s.pairingCode,
       claudePath: s.claudePath,
       transcribeCommand: s.transcribeCommand,

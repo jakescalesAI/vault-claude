@@ -255,6 +255,7 @@ body.theme-dark .vc-root {
 .vc-assistant blockquote { margin: 0 0 10px; padding-left: 12px; box-shadow: inset 2px 0 0 var(--vc-sep); color: var(--vc-text-2); }
 
 .vc-error { font-size: 15px; color: var(--vc-red); white-space: pre-wrap; overflow-wrap: anywhere; }
+.vc-note { font-size: 15px; color: var(--vc-text-2); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .vc-typing {
   align-self: flex-start;
@@ -735,5 +736,7 @@ body.theme-dark .vc-root {
 /* Narrow pane: the note name matters more than its state. */
 @container (max-width: 300px) { .vc-chip-note { display: none; } }
 .vc-select { width: 100%; }
+.vc-model-input { width: 100%; margin-top: 6px; }
+.vc-status-row { cursor: pointer; }
 .vc-empty-mark { width: 44px; height: 44px; }
 .vc-empty-mark svg { width: 100%; height: 100%; }

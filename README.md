@@ -62,6 +62,7 @@ Keep Obsidian open on the computer, and keep the computer awake, while you use i
 
 - **"Claude Code wasn't found"**: set **Claude Code location** in settings to the full path of `claude` (`where claude` on Windows, `which claude` on macOS/Linux).
 - **"Port … is already in use"**: choose another port and update the address on your other devices.
+- **Check the connection**: tap the status line under the chat title, or use **Check** in settings. It says why this device can't reach your computer (asleep, Obsidian closed, off Tailscale, pairing code wrong, Claude Code not logged in) and shows the plugin version on both ends.
 - **iPad says "Not connected"**: check that Tailscale is on for both devices, that the computer is awake with Obsidian open, and that the address matches the one shown on the computer. On Windows, allow Obsidian through the firewall for private networks when asked.
 - **"Not paired"**: the pairing code on the device doesn't match the computer. Copy it again.
 - **Shell commands are refused**: in this headless mode Claude Code can't ask you for approval. Allow the commands you want in Claude Code's `settings.json` permissions.
@@ -71,10 +72,13 @@ Keep Obsidian open on the computer, and keep the computer awake, while you use i
 There is no build step: `main.js` is plain CommonJS. The host uses only Node built-ins, loaded lazily, so the same file runs on mobile.
 
 ```
+node test/copilot.test.cjs       # providers, keys, errors, build log: fake keys, stub provider, fake Claude Code
+node test/real-cli.test.cjs      # real Claude Code through the translator, on a stub provider, with no account
+node test/view.test.cjs          # the view at phone width in headless Chromium, with no Node
 node test/host-test.cjs main.js /path/to/a/vault
 ```
 
-This starts the host on port 8799 and runs real Claude Code turns through it: pairing, streaming, resume, attachments and dictation.
+The last one needs a logged-in Claude Code. It starts the host on port 8799 and runs real Claude Code turns through it: pairing, streaming, resume, attachments and dictation.
 
 Releases: bump `version` in `manifest.json` and `versions.json`, commit, then push a tag with the same version (`git tag 0.4.1 && git push --tags`). The workflow attaches the three plugin files to a GitHub release.
 
@@ -84,6 +88,14 @@ MIT
 
 ## Other model providers
 
-Claude uses your Claude login. To add another provider, put its API key in Quartzi Copilot settings on the computer, or set its usual environment variable (for example `DEEPSEEK_API_KEY`). It then appears in the brain menu with the models it currently offers.
+Claude uses your Claude login. Every other provider also runs through Claude Code on your computer, so that computer still needs Claude Code installed.
 
-Supported: OpenAI, Google Gemini, DeepSeek, xAI, OpenRouter, Groq, Mistral, Moonshot Kimi, Z.ai GLM, Together AI, Ollama, LM Studio, and any OpenAI-compatible address. Requests are translated by a server on 127.0.0.1, so Claude Code's file and shell tools keep working. MCP servers are off for these chats. Keys stay on the computer and never sync.
+Supported: Anthropic API, OpenAI, Google Gemini, DeepSeek, xAI, OpenRouter, Groq, Mistral, Moonshot Kimi, Z.ai GLM, Together AI, Ollama, LM Studio, and any OpenAI-compatible server added under **Custom endpoints** (name, base URL, key variable, model list). Requests other than Anthropic's are translated by a server on 127.0.0.1, so Claude Code's file and shell tools keep working.
+
+**Keys** stay on the computer that runs the host. Set the provider's usual environment variable (for example `DEEPSEEK_API_KEY`), or save the key in settings, which seals it with the OS keychain in that device's local storage. Keys are never written to `data.json`, so sync can't copy them, and settings only ever show whether one is set. Provider keys are kept out of Claude Code's environment; `ANTHROPIC_API_KEY` is the one exception, because Claude Code reads it itself.
+
+**Models** are listed live where the provider offers a list. Pick **Type a model…** in the brain menu for anything else. A model that can't use tools still answers: the chat says it is running text only, and it can't read or change notes on that turn.
+
+## Build log
+
+Type `/log what you did` in the chat, or ask the copilot to log something, and it adds a dated bullet to a plain note (`0 Home/0 Quartzi Copilot/Build log.md` by default; change it in settings). The log can't live in `10 Money`.

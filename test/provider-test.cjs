@@ -1,5 +1,6 @@
 // Drives the real Host through another provider: lists models, then a chat that must use a tool.
 // usage: node test/provider-test.cjs main.js <vault> provider model [mode]   (needs that provider's key in the environment)
+// With no real key: node test/stub-provider.cjs 1234, then run this with provider lmstudio, model good-model.
 const fs = require("fs");
 const [, , mainPath, vaultPath, provider, providerModel, mode] = process.argv;
 const PORT = +(process.env.P || 8798);
@@ -27,8 +28,9 @@ new Function("require", "module", fs.readFileSync(mainPath, "utf8") + "\n;module
       const ev = m.event;
       if (ev.type === "assistant") for (const b of ev.message.content || []) { if (b.type === "tool_use") tools++; if (b.type === "text") text += b.text; }
       if (ev.type === "result") {
-        console.log(!ev.is_error && tools && /FILES=/.test(text) ? "PASS" : "FAIL", `tools=${tools}`, JSON.stringify(text.slice(-200)), ev.is_error ? String(ev.result).slice(0, 300) : "");
-        clearTimeout(done); host.stop(); process.exit(0);
+        const ok = !ev.is_error && tools && /FILES=/.test(text);
+        console.log(ok ? "PASS" : "FAIL", `tools=${tools}`, JSON.stringify(text.slice(-200)), ev.is_error ? String(ev.result).slice(0, 300) : "");
+        clearTimeout(done); host.stop(); process.exit(ok ? 0 : 1);
       }
     }
   };
