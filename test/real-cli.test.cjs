@@ -32,6 +32,7 @@ function client(port) {
 (async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "copilot-real-"));
   const vault = path.join(tmp, "vault"), config = path.join(tmp, "config");
+  os.homedir = () => tmp;  // Copilot's own folder for outside chats lands here
   fs.mkdirSync(vault);
   fs.mkdirSync(config);
   // Someone who has allowed a shell command in their settings still can't aim it at 10 Money.

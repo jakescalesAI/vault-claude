@@ -69,6 +69,7 @@ const resultOf = (msgs) => { const r = msgs.find((m) => m.type === "event" && m.
 
 (async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "copilot-test-"));
+  os.homedir = () => tmp;  // Copilot's own folder for outside chats lands here
   const fake = path.join(tmp, "claude");
   fs.copyFileSync(path.join(__dirname, "fake-claude.cjs"), fake);
   fs.chmodSync(fake, 0o755);
@@ -235,7 +236,7 @@ const resultOf = (msgs) => { const r = msgs.find((m) => m.type === "event" && m.
 
   // ---------- shell on outside providers ----------
   T.PROVIDERS.lmstudio.base = stub.base;
-  const shellOff = (a) => ["Bash", "PowerShell"].every((rule) => denied(a).includes(rule));
+  const shellOff = (a) => ["Bash", "PowerShell", "Read(./.trash/**)", "Edit(./.trash/**)", "Read(./.git/**)", "Read(./.obsidian/**)", "Edit(./.obsidian/**)"].every((rule) => denied(a).includes(rule));
   const shellFor = async (msg) => { const m = await turn(c, msg); const a = seen().at(-1).args; return { off: shellOff(a), told: m.some((x) => x.type === "warning" && /Shell commands are off/.test(x.message)), asked: a.some((x) => x.includes("Shell commands are off in this chat")), msgs: m }; };
   for (const [name, msg] of [["OpenAI", { provider: "openai", providerModel: "good-model" }], ["Mistral", { provider: "mistral", providerModel: "good-model" }], ["a custom endpoint at localhost", { provider: "custom-a", providerModel: "typed-model" }]]) {
     const r = await shellFor(msg);
@@ -245,6 +246,42 @@ const resultOf = (msgs) => { const r = msgs.find((m) => m.type === "event" && m.
     const r = await shellFor(msg);
     check(`${name}: shell stays, nothing said`, !r.off && !r.told && !r.asked, [r.off, r.told, r.asked]);
   }
+  // ---------- outside chats carry none of the user's setup ----------
+  process.env.CLAUDE_CODE_MESSAGING_SOCKET = "/tmp/fake-socket";
+  process.env.CLAUDE_CODE_GIT_BASH_PATH = "C:\\Git\\bin\\bash.exe";
+  process.env.CLAUDE_CONFIG_DIR = "/tmp/users-own-config";
+  const flagged = (a, name) => a.includes(name) ? a[a.indexOf(name) + 1] : null;
+  await turn(c, { provider: "openai", providerModel: "other-model" });
+  run = seen().at(-1);
+  const ownConfig = path.join(tmp, ".quartzi-copilot", "outside-claude");
+  check("an outside chat gets Copilot's own config", run.env.CLAUDE_CONFIG_DIR === ownConfig && fs.statSync(ownConfig).isDirectory(), run.env.CLAUDE_CONFIG_DIR);
+  check("and none of the user's CLAUDE_CODE_ variables", !run.env.CLAUDE_CODE_MESSAGING_SOCKET && Object.keys(run.env).filter((k) => k.startsWith("CLAUDE_CODE_")).sort().join() === "CLAUDE_CODE_DISABLE_AUTO_MEMORY,CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,CLAUDE_CODE_GIT_BASH_PATH", Object.keys(run.env).filter((k) => k.startsWith("CLAUDE_CODE_")));
+  check("and no project or local settings, or hooks", flagged(run.args, "--setting-sources") === "user" && JSON.parse(flagged(run.args, "--settings")).disableAllHooks === true, run.args);
+  for (const [name, msg] of [["LM Studio", { provider: "lmstudio", providerModel: "other-model" }], ["Anthropic API", { provider: "anthropic", providerModel: "other-model", effort: "high" }], ["Claude login", { provider: "claude", model: "opus", effort: "low" }]]) {
+    await turn(c, msg);
+    run = seen().at(-1);
+    check(`${name} keeps the user's setup`, run.env.CLAUDE_CONFIG_DIR === "/tmp/users-own-config" && run.env.CLAUDE_CODE_MESSAGING_SOCKET === "/tmp/fake-socket" && !run.args.includes("--setting-sources") && !JSON.parse(flagged(run.args, "--settings")).disableAllHooks, run.env.CLAUDE_CONFIG_DIR);
+  }
+  for (const k of ["CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_GIT_BASH_PATH", "CLAUDE_CONFIG_DIR"]) delete process.env[k];
+
+  // ---------- selection ----------
+  const promptOf = (ctx) => host.buildPrompt({ text: "hi", context: ctx }, []);
+  check("a selection with no note is dropped", !promptOf({ selection: "STRAY" }).includes("STRAY"));
+  check("a selection in a normal note stays", promptOf({ activeFile: "a.md", selection: "PLAIN" }).includes("PLAIN"));
+  check("a selection in a note that doesn't exist yet stays", promptOf({ activeFile: "not-synced.md", selection: "PLAIN" }).includes("PLAIN"));
+  const vault = tmp;
+  fs.mkdirSync(path.join(vault, "10 Money"), { recursive: true });
+  fs.writeFileSync(path.join(vault, "10 Money", "real.md"), "x");
+  fs.symlinkSync(path.join(vault, "10 Money", "real.md"), path.join(vault, "link.md"));
+  fs.symlinkSync(path.join(vault, "10 Money"), path.join(vault, "folder-link"));
+  let linked = promptOf({ activeFile: "link.md", selection: "LINKED", openFiles: ["folder-link/real.md", "a.md"] });
+  check("a selection in a link into 10 Money is dropped", !linked.includes("LINKED") && !linked.includes("link.md"), linked);
+  check("an open note behind a linked folder is left out", !linked.includes("folder-link") && linked.includes("a.md"), linked);
+  linked = promptOf({ activeFile: "folder-link/real.md", selection: "LINKED" });
+  check("a selection behind a linked folder is dropped", !linked.includes("LINKED"), linked);
+  fs.rmSync(path.join(vault, "link.md"));
+  fs.rmSync(path.join(vault, "folder-link"));
+
   const first = await shellFor({ provider: "openai", providerModel: "good-model" });
   const sessionId = first.msgs.find((m) => m.type === "event" && m.event.session_id).event.session_id;
   const again = await shellFor({ provider: "openai", providerModel: "good-model", sessionId });

@@ -24,7 +24,7 @@ process.stdin.on("data", async (d) => {
     buf = buf.slice(nl + 1);
     if (!line.trim()) continue;
     const env = {};
-    for (const k of Object.keys(process.env)) if (/KEY|TOKEN|ANTHROPIC/.test(k)) env[k] = process.env[k];
+    for (const k of Object.keys(process.env)) if (/KEY|TOKEN|ANTHROPIC|^CLAUDE/.test(k)) env[k] = process.env[k];
     record({ args, env });
     say({ type: "system", subtype: "init", session_id: session });
     if (process.env.FAKE_LOGIN === "no") { say({ type: "result", is_error: true, result: "Not logged in · Please run /login", num_turns: 1, session_id: session }); continue; }

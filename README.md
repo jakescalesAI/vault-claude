@@ -75,6 +75,7 @@ There is no build step: `main.js` is plain CommonJS. The host uses only Node bui
 ```
 node test/copilot.test.cjs       # providers, keys, errors, build log: fake keys, stub provider, fake Claude Code
 node test/real-cli.test.cjs      # real Claude Code through the translator, on a stub provider, with no account
+node test/outside.test.cjs       # what never reaches an outside provider, on real Claude Code; add --root-config for this machine's own config
 node test/view.test.cjs          # the view at phone width in headless Chromium, with no Node
 node test/host-test.cjs main.js /path/to/a/vault
 ```
@@ -98,6 +99,8 @@ Supported: Anthropic API, OpenAI, Google Gemini, DeepSeek, xAI, OpenRouter, Groq
 **Models** are listed live where the provider offers a list. Pick **Type a model…** in the brain menu for anything else.
 
 **Shell commands** are off for every provider except Ollama, LM Studio, Claude login and the Anthropic API, and the chat says so when it starts. A custom endpoint counts as outside, even at a localhost address.
+
+**Outside chats start clean.** They get their own Claude Code folder (`~/.quartzi-copilot/outside-claude`), so your memory, hooks, extra folders and old chats stay out, and they load no settings or `CLAUDE.md` from the vault. They can't open `.trash`, `.git` or `.obsidian`. Switching a chat to or from an outside provider starts a new conversation and says so, so earlier messages aren't sent. Moving between outside providers carries on.
 
 A model that can't use tools still answers: the chat says it is running text only, and it can't read or change notes on that turn.
 

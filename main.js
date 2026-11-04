@@ -93,8 +93,10 @@ function diagnose({ url, mobile, unpaired, probe, version, last }) {
 // Why the build log can't go at this path, or "" if it can.
 // 10 Money stays out of every chat: what a chat reads reaches whichever provider it runs on.
 const PRIVATE_DENY = ["Read(./10 Money/**)", "Edit(./10 Money/**)", "Bash(*10 Money*)", "PowerShell(*10 Money*)"];
-// Chats that leave this computer get no shell, because a plain grep -r would carry 10 Money with it.
-const SHELL_DENY = ["Bash", "PowerShell", "Monitor"];
+// Chats that leave this computer get no shell, because a plain grep -r would carry 10 Money with it,
+// no Obsidian trash or git history, because both can hold copies from there, and no .obsidian,
+// because plugin data holds pairing codes and sync logins, and plugin code runs when edited.
+const OUTSIDE_DENY = ["Bash", "PowerShell", "Monitor", ...[".trash", ".git", ".obsidian"].flatMap((d) => [`Read(./${d}/**)`, `Edit(./${d}/**)`])];
 const NO_SHELL_PROMPT = "Shell commands are off in this chat. If a task needs one, say so plainly.";
 const PRIVATE_PROMPT = "Never read, search, list or edit the 10 Money folder, even if asked. Leave it out of any shell search, for example grep --exclude-dir=\"10 Money\".";
 
@@ -893,7 +895,7 @@ class VaultClaudeView extends ItemView {
     if (msg.type === "status") { this.onHostStatus(msg); if (this.ready) this.setStatus("on"); return; }
     if (msg.type === "warning") { this.addItem({ kind: "note", text: msg.message }); return; }
     if (msg.type === "transcript") { this.onTranscript(msg); return; }
-    if (msg.type === "notice") { this.session.id = null; this.toast(msg.message.split(".")[0]); return; }
+    if (msg.type === "notice") { this.session.id = null; this.addItem({ kind: "note", text: msg.message }); return; }
     if (msg.type === "models") {
       this.providers = msg.providers || [];
       const s = this.plugin.settings;
@@ -2124,15 +2126,29 @@ class Host {
     ws.onclose = () => { clearTimeout(authTimer); this.conns.delete(ws); };
   }
 
+  // A link can lead into the private folder, so where the note really is decides.
+  privateNote(file) {
+    if (isPrivate(file)) return true;
+    if (!file) return false;
+    const path = nodeRequire("path");
+    const fs = nodeRequire("fs");
+    try {
+      const root = fs.realpathSync(this.config.vaultPath);
+      return isPrivate(path.relative(root, fs.realpathSync(path.resolve(root, file))));
+    } catch (e) {
+      return false;
+    }
+  }
+
   buildPrompt(msg, saved) {
     const ctx = msg.context || {};
     const lines = [];
     // Checked here too, because a device on an older version still sends these.
-    const hidden = isPrivate(ctx.activeFile);
-    const others = (ctx.openFiles || []).filter((p) => !isPrivate(p));
+    const hidden = this.privateNote(ctx.activeFile);
+    const others = (ctx.openFiles || []).filter((p) => !this.privateNote(p));
     if (ctx.activeFile && !hidden) lines.push(`The note the user is looking at: ${ctx.activeFile}`);
     if (others.length) lines.push("Other notes they have open in tabs or windows and chose to share (read or edit them as the request needs): " + others.slice(0, 20).join(", "));
-    if (ctx.selection && !hidden) lines.push("They have this text selected in it:\n<selection>\n" + String(ctx.selection).slice(0, 8000) + "\n</selection>");
+    if (ctx.selection && ctx.activeFile && !hidden) lines.push("They have this text selected in it:\n<selection>\n" + String(ctx.selection).slice(0, 8000) + "\n</selection>");
     let prompt = String(msg.text || "");
     if (lines.length) prompt = "<obsidian-context>\n" + lines.join("\n") + "\n</obsidian-context>\n\n" + prompt;
     if (saved.length) {
@@ -2218,6 +2234,14 @@ class Host {
 
   // Provider keys stay out of Claude Code's environment, so a tool step can't print them. The one
   // exception is ANTHROPIC_API_KEY: Claude Code itself reads that one.
+  // An outside chat sees none of the user's Claude Code setup: no memory, hooks, extra folders or
+  // old transcripts. Its own config also means a chat from elsewhere can't be resumed into it.
+  outsideConfig() {
+    const dir = nodeRequire("path").join(nodeRequire("os").homedir(), ".quartzi-copilot", "outside-claude");
+    nodeRequire("fs").mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return dir;
+  }
+
   childEnv() {
     const env = Object.assign({}, process.env);
     for (const id of this.providerIds()) {
@@ -2234,9 +2258,18 @@ class Host {
       delete env.ANTHROPIC_AUTH_TOKEN;
       return Object.assign(env, { ANTHROPIC_API_KEY: cfg.key, ANTHROPIC_BASE_URL: cfg.base });
     }
-    return Object.assign(this.childEnv(), {
+    const env = this.childEnv();
+    if (this.offComputer(provider)) {
+      // Git Bash stays: Claude Code won't start on Windows without it, even with the shell off.
+      for (const k of Object.keys(env)) if (/^CLAUDE_CODE_/.test(k) && k !== "CLAUDE_CODE_GIT_BASH_PATH") delete env[k];
+      env.CLAUDE_CONFIG_DIR = this.outsideConfig();
+      env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+    }
+    return Object.assign(env, {
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${this.translatorPort}/p/${provider}`,
       ANTHROPIC_AUTH_TOKEN: this.translatorToken,
+      // A logged-in Claude Code sends its own login as the authorization header instead.
+      ANTHROPIC_CUSTOM_HEADERS: `x-copilot-token: ${this.translatorToken}`,
       ANTHROPIC_API_KEY: "",
       ANTHROPIC_MODEL: model,
       ANTHROPIC_SMALL_FAST_MODEL: model,
@@ -2264,7 +2297,7 @@ class Host {
     const memo = new Map();
     this.translator = nodeRequire("http").createServer((req, res) => {
       const m = /^\/p\/([\w-]+)\/v1\/messages(\/count_tokens)?/.exec(req.url);
-      const auth = String(req.headers.authorization || "").replace(/^Bearer /, "") || req.headers["x-api-key"];
+      const auth = req.headers["x-copilot-token"] || String(req.headers.authorization || "").replace(/^Bearer /, "") || req.headers["x-api-key"];
       const fail = (code, message) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify({ type: "error", error: { type: "api_error", message } })); };
       if (!m || auth !== this.translatorToken) return fail(404, "Not found");
       const cfg = this.providerConfig(m[1]);
@@ -2323,11 +2356,12 @@ class Host {
     const [mode, model, effort, provider] = sig.split("|");
     const attachRoot = path.join(this.tmp, "attachments");
     fs.mkdirSync(attachRoot, { recursive: true });
-    const noShell = this.offComputer(provider);
-    const deny = noShell ? PRIVATE_DENY.concat(SHELL_DENY) : PRIVATE_DENY;
+    const outside = this.offComputer(provider);
+    const settings = outside ? { permissions: { deny: PRIVATE_DENY.concat(OUTSIDE_DENY) }, disableAllHooks: true } : { permissions: { deny: PRIVATE_DENY } };
     const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-      "--include-partial-messages", "--append-system-prompt", this.systemPrompt(noShell), "--add-dir", attachRoot,
-      "--permission-mode", mode, "--model", model, "--settings", JSON.stringify({ permissions: { deny } })];
+      "--include-partial-messages", "--append-system-prompt", this.systemPrompt(outside), "--add-dir", attachRoot,
+      "--permission-mode", mode, "--model", model, "--settings", JSON.stringify(settings)];
+    if (outside) args.push("--setting-sources", "user");
     // Other providers run through the local translator with Claude Code's built-in tools.
     // MCP servers stay off there: their hundreds of tools exceed what those APIs accept.
     const translated = provider && this.providerDef(provider).kind !== "anthropic";
@@ -2376,7 +2410,8 @@ class Host {
       // A chat from another computer or an older setup can't be resumed here: rerun the
       // message as a new conversation instead of failing.
       if (c.resumed && !t.events && (c.resumeFailed || /No conversation found/i.test(c.stderr))) {
-        t.ws.send({ type: "notice", message: "Started a new conversation. The earlier one isn't on this computer." });
+        const [, , , pid] = sig.split("|");
+        t.ws.send({ type: "notice", message: this.offComputer(pid) ? `Started a new conversation. The earlier messages in this chat weren't sent to ${this.providerDef(pid).name}.` : "Started a new conversation. The earlier one can't continue here." });
         this.runTurn(t.ws, Object.assign({}, t.msg, { sessionId: null }), t.saved);
         return;
       }

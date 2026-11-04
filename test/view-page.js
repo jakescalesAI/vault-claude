@@ -129,6 +129,8 @@
     view.closeMenu();
     check("the page doesn't scroll sideways", document.documentElement.scrollWidth <= window.innerWidth, document.documentElement.scrollWidth);
 
+    ws.say({ type: "notice", message: "Started a new conversation. The earlier messages in this chat weren't sent to OpenAI." });
+    check("a new conversation says why in the chat", /weren't sent to OpenAI/.test(view.messagesEl.textContent) && view.session.id === null, view.messagesEl.textContent);
     ws.say({ type: "warning", message: "x is running text only." });
     await new Promise((r) => setTimeout(r, 20));
     check("a warning shows in the chat", /text only/.test(view.messagesEl.textContent) && !!document.querySelector(".vc-note"), view.messagesEl.textContent);
