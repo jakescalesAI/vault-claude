@@ -208,7 +208,7 @@ body.theme-dark .vc-root {
   inset: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 74px 16px calc(var(--vc-composer-h, 150px) + var(--vc-kb, 0px) + 12px);
+  padding: 74px 16px calc(var(--vc-composer-h, 150px) + max(var(--vc-kb, 0px), var(--vc-nav, 0px)) + 12px);
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -362,7 +362,7 @@ body.theme-dark .vc-root {
   position: absolute;
   left: 0;
   right: 0;
-  bottom: var(--vc-kb, 0px);
+  bottom: max(var(--vc-kb, 0px), var(--vc-nav, 0px));
   z-index: 2;
   isolation: isolate;
   transition: bottom 0.2s ease;
@@ -698,7 +698,7 @@ body.theme-dark .vc-root {
 .vc-toast {
   position: absolute;
   left: 50%;
-  bottom: calc(var(--vc-composer-h, 150px) + var(--vc-kb, 0px) + 12px);
+  bottom: calc(var(--vc-composer-h, 150px) + max(var(--vc-kb, 0px), var(--vc-nav, 0px)) + 12px);
   z-index: 30;
   display: inline-flex;
   align-items: center;
@@ -740,3 +740,53 @@ body.theme-dark .vc-root {
 .vc-status-row { cursor: pointer; }
 .vc-empty-mark { width: 44px; height: 44px; }
 .vc-empty-mark svg { width: 100%; height: 100%; }
+
+/* ---------- phones and iPads ---------- */
+/* Obsidian's phone and iPad app switches text selection off everywhere. A text box left in that state cannot take the
+   iOS keyboard: that is why the message box showed no keyboard. Every box in Copilot is switched back on. */
+.vc-root textarea, .vc-root input, .vc-root .vc-input { -webkit-user-select: text !important; user-select: text !important; -webkit-touch-callout: default; }
+.vc-root button { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+/* On a touch screen a long press on a message opens its menu (Reply, Copy, Select Text). The text itself is not
+   selectable there, so the press does one thing instead of two. Select Text opens it where it can be selected. */
+.is-mobile .vc-messages, .is-mobile .vc-messages * { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.vc-select-text, .vc-select-text * { -webkit-user-select: text !important; user-select: text !important; -webkit-touch-callout: default !important; }
+.vc-select-text { padding-top: 16px !important; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 17px; line-height: 1.45; min-height: 30vh; }
+.vc-copy-src { position: fixed; top: 0; left: 0; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; -webkit-user-select: text !important; user-select: text !important; }
+.vc-kb-note { padding: 0 6px 6px; font-size: 11px; line-height: 1.3; color: var(--vc-text-2); -webkit-user-select: text; user-select: text; }
+
+/* ---------- the strip under the chat in a side drawer ---------- */
+/* On a phone, Obsidian's side drawer puts its tab picker and a file-name bar under whatever tab is showing. While
+   Copilot is that tab, both are hidden so the chat has the whole drawer. Any other tab is opened from the command
+   palette or its own button, and the picker comes back with it. */
+.is-mobile .workspace-drawer:has(.workspace-drawer-active-tab-content .vc-root) .workspace-drawer-tab-options,
+.is-mobile .workspace-drawer:has(.workspace-drawer-active-tab-content .vc-root) .workspace-drawer-header { display: none !important; }
+
+/* ---------- riding the keyboard ---------- */
+/* The composer moves with a transform, which the phone can animate without laying the chat out again on every frame.
+   It glides only when the keyboard itself is moving (vc-kb-glide), on the timing Obsidian uses for its own toolbar.
+   Every other correction is instant, so nothing bounces when Obsidian resizes the view underneath it. */
+.vc-root .vc-composer { bottom: 0; transition: none; transform: translate3d(0, calc(-1 * max(var(--vc-kb, 0px), var(--vc-nav, 0px))), 0); will-change: transform; }
+.vc-root.vc-kb-glide .vc-composer { transition: transform 300ms cubic-bezier(0.12, 0, 0.44, 0.99); }
+.is-android .vc-root.vc-kb-glide .vc-composer { transition: transform 350ms cubic-bezier(0.22, 0.25, 0, 1); }
+
+/* ---------- the whole panel ---------- */
+/* In the side drawer Obsidian keeps a band at the top and bottom, in its own grey, for the status bar and the home
+   bar. While this view is the tab showing, the bands are given to the view: it runs edge to edge and keeps its own
+   content clear of the status bar and the home bar. */
+.is-mobile .workspace-drawer:has(.workspace-drawer-active-tab-content .vc-root) .workspace-drawer-inner { padding-top: 0 !important; padding-bottom: 0 !important; }
+.workspace-drawer .vc-root { --vc-top: env(safe-area-inset-top, 0px); }
+.workspace-drawer .vc-root .vc-header { padding-top: calc(6px + var(--vc-top, 0px)); }
+.workspace-drawer .vc-root .vc-messages { padding-top: calc(74px + var(--vc-top, 0px)); }
+/* The gap for the home bar stays under the message box at all times and slides behind the keyboard with it, so the box
+   does not hop at the moment the keyboard starts to move. */
+.workspace-drawer .vc-root.vc-keyboard .vc-composer { padding-bottom: calc(4px + env(safe-area-inset-bottom, 0px)); }
+.workspace-drawer .vc-root .vc-composer { transform: translate3d(0, calc(-1 * max(var(--vc-kb, 0px) - env(safe-area-inset-bottom, 0px), 0px)), 0); }
+
+/* ---------- in step with the keyboard ---------- */
+/* The iOS keyboard starts fast and eases out. The box uses the same shape, so it stays on top of the keyboard all the
+   way up instead of being overtaken at the start. */
+.vc-root.vc-kb-glide .vc-composer { transition: transform 280ms cubic-bezier(0.38, 0.7, 0.125, 1); }
+.is-android .vc-root.vc-kb-glide .vc-composer { transition: transform 350ms cubic-bezier(0.22, 0.25, 0, 1); }
+/* In a drawer the box overlaps the keyboard by the home-bar gap, so the chat must leave that much less room under the
+   last message. */
+.workspace-drawer .vc-root .vc-messages { padding-bottom: calc(var(--vc-composer-h, 150px) + max(var(--vc-kb, 0px) - env(safe-area-inset-bottom, 0px), var(--vc-nav, 0px), 0px) + 12px); }

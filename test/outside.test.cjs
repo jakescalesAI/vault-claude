@@ -32,7 +32,7 @@ function client(port) {
     const msgs = [];
     ws.onmessage = (e) => msgs.push(JSON.parse(e.data));
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: "auth", token: "T", version: "0.9.0" }));
+      ws.send(JSON.stringify({ type: "auth", token: "TEST-TEST-TEST-TEST", version: "0.9.0" }));
       resolve({ ws, msgs, send: (o) => ws.send(JSON.stringify(o)), until: async (pred, ms = 90000) => { const end = Date.now() + ms; for (;;) { const hit = msgs.find(pred); if (hit) return hit; if (Date.now() > end) return null; await new Promise((r) => setTimeout(r, 25)); } } });
     };
   });
@@ -100,7 +100,7 @@ function client(port) {
   process.env.XAI_API_KEY = "fake-xai-key-0000000000";
 
   const PORT = rootConfig ? 18793 : 18792;
-  const host = new Host({ vaultPath: vault, port: PORT, bind: "local", token: "T", claudePath: process.env.CLAUDE_PATH || "claude", transcribeCommand: "x", version: "0.9.0", logPath: "Build log.md", configDir: ".my-config", log() {} });
+  const host = new Host({ vaultPath: vault, port: PORT, bind: "local", token: "TEST-TEST-TEST-TEST", claudePath: process.env.CLAUDE_PATH || "claude", transcribeCommand: "x", version: "0.9.0", logPath: "Build log.md", configDir: ".my-config", log() {} });
   await host.start();
   const c = await client(PORT);
   await c.until((m) => m.type === "status", 20000);

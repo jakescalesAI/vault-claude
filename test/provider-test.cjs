@@ -9,12 +9,12 @@ const obsidian = { Plugin: Stub, ItemView: Stub, PluginSettingTab: Stub, Setting
 const mod = { exports: {} };
 new Function("require", "module", fs.readFileSync(mainPath, "utf8") + "\n;module.exports.__Host = Host;")((n) => (n === "obsidian" ? obsidian : require(n)), mod);
 (async () => {
-  const host = new mod.exports.__Host({ vaultPath, port: PORT, bind: "local", token: "T", claudePath: "", transcribeCommand: "x" }, () => {});
+  const host = new mod.exports.__Host({ vaultPath, port: PORT, bind: "local", token: "TEST-TEST-TEST-TEST", claudePath: "", transcribeCommand: "x" }, () => {});
   await host.start();
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
   let text = "", tools = 0;
   const done = setTimeout(() => { console.log("TIMEOUT", text); process.exit(1); }, 170000);
-  ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token: "T" }));
+  ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token: "TEST-TEST-TEST-TEST" }));
   ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.type === "hello") ws.send(JSON.stringify({ type: "models" }));

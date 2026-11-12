@@ -6,8 +6,8 @@ const { addIcon, normalizePath, Plugin, ItemView, PluginSettingTab, Setting, Mar
 
 const VIEW_TYPE = "vault-claude-view";
 const DEFAULT_SETTINGS = {
-  serverUrl: "", // the host other devices connect to, e.g. ws://100.x.y.z:8787
-  pairingCode: "", // made by the host; synced devices pick it up from data.json
+  serverUrl: "", // the host other devices connect to, e.g. ws://100.x.y.z:8787 (kept on each device, see LOCAL_SETTINGS)
+  pairingCode: "", // made by the host and typed into each other device once (kept on each device)
   hostPort: 8787,
   placement: "beside", // iPad: "beside" the note or "sidebar"
   hostBind: "local", // "local" | "tailscale" | "all"
@@ -20,8 +20,45 @@ const DEFAULT_SETTINGS = {
   providerModel: "",
   sendContext: true,
   logPath: "0 Home/0 Quartzi Copilot/Build log.md", // outside the sorter and the scheduler
+  keepToolOutput: false, // keep what tools returned in saved chats (kept on each device)
   sessions: [], // [{id, title, updated, pinned?, items: [...]}] newest first
 };
+// Settings that belong to one device and never go into data.json. data.json syncs to every device and can
+// be read by anything that reads the vault, and these either let a device run things on the host (the
+// pairing code), decide what the host runs (Claude Code's path, the speech command), or where it listens.
+const LOCAL_SETTINGS = ["serverUrl", "pairingCode", "hostPort", "hostBind", "claudePath", "transcribeCommand", "keepToolOutput"];
+const MIN_CODE_LENGTH = 16;
+
+// What a saved chat keeps of a tool call when tool output is not kept: its name and the short facts
+// that say what it touched, never what came back.
+function trimToolItem(item) {
+  if (!item || item.kind !== "tool") return item;
+  const input = {};
+  for (const k of ["file_path", "notebook_path", "path", "pattern", "command", "url", "description", "query"]) {
+    if (item.input && item.input[k] !== undefined) input[k] = String(item.input[k]).slice(0, 300);
+  }
+  const out = Object.assign({}, item, { input, trimmed: true });
+  if (item.result !== undefined) out.result = "";
+  return out;
+}
+
+function trimSession(s) {
+  return Object.assign({}, s, { items: (s.items || []).map(trimToolItem) });
+}
+
+// Model replies are shown as markdown. A picture in markdown loads from the internet as soon as it is
+// drawn, which would let a reply send words from the chat to any address without anyone clicking.
+// Pictures become plain links, and HTML that loads things is shown as text. Vault embeds (![[...]]) stay.
+// Code blocks and inline code are left exactly as they are.
+function safeMarkdown(text) {
+  const parts = String(text || "").split(/(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/);
+  return parts.map((p, i) => {
+    if (i % 2) return p; // code
+    return p
+      .replace(/!\[(?!\[)/g, "[")
+      .replace(/<(?=\/?\s*(img|image|iframe|frame|video|audio|source|track|embed|object|picture|link|meta|base|svg|style|script)\b)/gi, "&lt;");
+  }).join("");
+}
 const MODELS = [["fable", "Fable"], ["opus", "Opus"], ["sonnet", "Sonnet"], ["haiku", "Haiku"]];
 const QUARTZI_MARK = '<g transform="scale(1.5625)" fill="currentColor"><polygon points="35.54,12.91 39.42,16.80 16.80,39.42 12.91,35.54"/><polygon opacity=".85" points="39.42,16.80 47.20,24.58 24.58,47.20 16.80,39.42"/><polygon opacity=".45" points="47.20,24.58 51.09,28.46 28.46,51.09 24.58,47.20"/><polygon opacity=".95" points="35.54,12.91 39.42,16.80 51.09,12.91"/><polygon opacity=".9" points="39.42,16.80 47.20,24.58 51.09,12.91"/><polygon opacity=".55" points="47.20,24.58 51.09,28.46 51.09,12.91"/><polygon opacity=".93" points="12.91,35.54 16.80,39.42 12.91,51.09"/><polygon opacity=".78" points="16.80,39.42 24.58,47.20 12.91,51.09"/><polygon opacity=".35" points="24.58,47.20 28.46,51.09 12.91,51.09"/></g>';
 const EFFORTS = [["low", "Low"], ["medium", "Med"], ["high", "High"], ["max", "Max"]];
@@ -93,9 +130,12 @@ function diagnose({ url, mobile, unpaired, probe, version, last }) {
 }
 
 // Why the build log can't go at this path, or "" if it can.
-// 10 Money stays out of every chat: what a chat reads reaches whichever provider it runs on.
-const PRIVATE_DENY = ["Read(./10 Money/**)", "Edit(./10 Money/**)", "Bash(*10 Money*)", "PowerShell(*10 Money*)"];
-// Chats that leave this computer get no shell, because a plain grep -r would carry 10 Money with it,
+// The money folder. Since 11-12-2026 a chat that runs on Claude or on a model on this computer
+// can read and edit it like any other folder.
+// A chat that leaves for another provider still cannot: what a chat reads reaches whichever provider it runs on.
+// It is "6 Money" now and was "10 Money" before the folders were renumbered, and both names are covered.
+const PRIVATE_FOLDERS = ["6 Money", "10 Money"]; const PRIVATE_DENY = PRIVATE_FOLDERS.flatMap((f) => [`Read(./${f}/**)`, `Edit(./${f}/**)`, `Bash(*${f}*)`, `PowerShell(*${f}*)`]);
+// Chats that leave this computer get no shell, because a plain grep -r would carry the money folder with it,
 // no Obsidian trash or git history, because both can hold copies from there, and no .obsidian,
 // because plugin data holds pairing codes and sync logins, and plugin code runs when edited.
 function outsideDeny(configDir, tmp, claudeConfig) {
@@ -106,20 +146,25 @@ function outsideDeny(configDir, tmp, claudeConfig) {
     // Claude Code lets a chat write its memory folder without asking, even with memory off.
     `Edit(${absoluteRule(claudeConfig)}/projects/*/memory/**)`];
 }
+// Every chat, whatever it runs on, may not change Obsidian's settings or plugins.
+function configDeny(configDir) {
+  const dirs = Array.from(new Set([".obsidian", configDir || ".obsidian"]));
+  return dirs.flatMap((d) => [`Edit(./${d}/**)`, `Bash(*${d}*)`, `PowerShell(*${d}*)`]);
+}
 // An absolute path in a permission rule starts with two slashes, and a Windows drive loses its colon.
 function absoluteRule(p) { return "/" + String(p).replace(/\\/g, "/").replace(/^([A-Za-z]):/, "/$1"); }
 const NO_SHELL_PROMPT = "Shell commands are off in this chat. If a task needs one, say so plainly.";
-const PRIVATE_PROMPT = "Never read, search, list or edit the 10 Money folder, even if asked. Leave it out of any shell search, for example grep --exclude-dir=\"10 Money\".";
+const PRIVATE_PROMPT = `Never read, search, list or edit the ${PRIVATE_FOLDERS[0]} folder, even if asked. Leave it out of any shell search, for example grep --exclude-dir="${PRIVATE_FOLDERS[0]}".`;
 
 function isPrivate(path) {
-  return String(path || "").replace(/\\/g, "/").split("/").some((p) => p.trim().toLowerCase() === "10 money");
+  return String(path || "").replace(/\\/g, "/").split("/").some((p) => PRIVATE_FOLDERS.some((f) => p.trim().toLowerCase() === f.toLowerCase()));
 }
 
 function logProblem(path) {
   const parts = String(path || "").split("/").map((p) => p.trim().toLowerCase());
   if (!/\.md$/i.test(path || "")) return "The build log has to be a note ending in .md.";
   if (parts.includes("..") || parts.includes("")) return "The build log path isn't valid.";
-  if (isPrivate(path)) return "The build log can't live in 10 Money.";
+  if (isPrivate(path)) return `The build log can't live in ${PRIVATE_FOLDERS[0]}.`;
   return "";
 }
 
@@ -186,6 +231,8 @@ class VaultClaudeView extends ItemView {
     const field = composer.createDiv("vc-field");
     this.inputEl = field.createEl("textarea", { cls: "vc-input", attr: { placeholder: "Message", rows: "1" } });
     this.inputEl.addEventListener("input", () => { this.autosize(); this.updateSendButton(); });
+    // A tap on the rounded field around the box counts as a tap on the box, so the keyboard comes up either way.
+    field.addEventListener("click", (e) => { if (e.target === field) this.inputEl.focus(); });
     this.inputEl.addEventListener("paste", (e) => {
       const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
       if (files.length) { e.preventDefault(); this.addFiles(files); }
@@ -224,22 +271,82 @@ class VaultClaudeView extends ItemView {
     this.updateUsage();
 
     // Keep the last message clear of the floating composer, whatever its height.
-    const fit = () => root.style.setProperty("--vc-composer-h", composer.offsetHeight + "px");
+    // On a phone Obsidian's floating toolbar lies over the bottom of a view in the main area, right where the message
+    // box is, and takes the taps meant for it. Measure how far it reaches into this view and stay above it.
+    const nav = () => {
+      const bar = document.querySelector(".mobile-navbar");
+      let up = 0;
+      if (bar && document.body.classList.contains("is-floating-nav")) {
+        const b = bar.getBoundingClientRect(), r = root.getBoundingClientRect();
+        if (b.width > 0 && b.height > 0 && b.top < r.bottom && b.bottom > r.top && b.left < r.right && b.right > r.left) up = Math.max(0, Math.round(r.bottom - b.top) + 8);
+      }
+      root.style.setProperty("--vc-nav", up + "px");
+    };
+    const fit = () => { nav(); root.style.setProperty("--vc-composer-h", composer.offsetHeight + "px"); };
+    this.registerEvent(this.app.workspace.on("layout-change", () => window.setTimeout(nav, 150)));
+    this.registerDomEvent(window, "resize", () => window.setTimeout(nav, 150));
+    this.registerDomEvent(this.inputEl, "focus", () => window.setTimeout(nav, 400));
+    this.registerDomEvent(this.inputEl, "blur", () => window.setTimeout(nav, 400));
     const vv = window.visualViewport;
-    if (vv && !Platform.isDesktopApp) {
-      const lift = () => {
-        const visibleBottom = vv.offsetTop + vv.height;
+    if (vv && (Platform.isMobile || !Platform.isDesktopApp)) {
+      let hint = null; // the height the keyboard announced, until Obsidian's own value has caught up
+      const lift = (glide) => {
+        // Obsidian's phone app publishes the keyboard's height. A side drawer does not shrink for the keyboard the way
+        // the main area does, so the part of this view the keyboard covers is worked out from that height as well.
+        const shell = hint === null ? (parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--keyboard-height")) || 0) : hint;
+        const visibleBottom = Math.min(vv.offsetTop + vv.height, window.innerHeight - shell);
         const kb = Math.max(0, Math.round(root.getBoundingClientRect().bottom - visibleBottom));
         const was = this.kb || 0;
         this.kb = kb;
+        if (this.kbNote) this.kbNote(shell);
+        if (kb === was) return; // nothing moved: leave a glide that is under way alone
+        // Glide only when the keyboard itself is moving. Anything else (Obsidian resizing the view) is applied at once.
+        root.toggleClass("vc-kb-glide", glide === true);
         root.style.setProperty("--vc-kb", kb + "px");
         root.toggleClass("vc-keyboard", kb > 40);
-        if (kb > was && this.messagesEl) this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+        if (kb > was && this.messagesEl) this.messagesEl.scrollTo({ top: this.messagesEl.scrollHeight, behavior: glide === true ? "smooth" : "auto" });
       };
       this.registerDomEvent(vv, "resize", lift);
       this.registerDomEvent(vv, "scroll", lift);
-      this.registerDomEvent(this.inputEl, "focus", () => { window.setTimeout(lift, 50); window.setTimeout(lift, 400); });
+      this.registerDomEvent(this.inputEl, "focus", () => { window.setTimeout(() => lift(true), 50); window.setTimeout(lift, 400); });
       this.registerDomEvent(this.inputEl, "blur", () => window.setTimeout(lift, 300));
+      // Obsidian announces the keyboard with these two events and moves its own layout over the next half second.
+      // The move starts the instant the keyboard does, in one glide. The later looks only correct it, without animation.
+      // The keyboard announces itself before it moves: "will show" carries the height it is about to have, "will hide"
+      // means it is going to zero. Obsidian's own --keyboard-height only changes once the keyboard has finished, so
+      // waiting for it left the box behind. The announced height is used until Obsidian's value has caught up.
+      let turn = 0;
+      const settle = (open, e) => {
+        const mine = ++turn;
+        const told = e ? Number(e.keyboardHeight || (e.detail && e.detail.keyboardHeight) || 0) : 0;
+        hint = open ? (told > 0 ? told : null) : 0;
+        nav(); lift(true);
+        // No height announced: catch Obsidian's value the moment it is set.
+        if (open && hint === null) for (const ms of [16, 40, 80, 140, 220]) window.setTimeout(() => { if (mine === turn) lift(true); }, ms);
+        window.setTimeout(() => { if (mine === turn) { nav(); lift(); } }, 420);
+        window.setTimeout(() => { if (mine === turn) { hint = null; nav(); lift(); } }, 1000);
+      };
+      // Obsidian resizes its main area when its own keyboard animation ends. Follow that in the same frame.
+      if (window.ResizeObserver) {
+        const watch = new ResizeObserver(() => lift());
+        watch.observe(root);
+        this.register(() => watch.disconnect());
+      }
+      this.registerDomEvent(window, "keyboardWillShow", (e) => settle(true, e));
+      this.registerDomEvent(window, "keyboardWillHide", (e) => settle(false, e));
+      // A line of keyboard measurements above the message box, hidden unless switched on in this device's settings.
+      // It is there so a layout problem on a phone can be read off a screenshot.
+      const note = createDiv({ cls: "vc-kb-note" });
+      composer.insertBefore(note, field);
+      this.kbNote = (shell) => {
+        const on = this.plugin.local("kbdebug") === "on";
+        note.style.display = on ? "" : "none";
+        if (!on) return;
+        if (shell === undefined) shell = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--keyboard-height")) || 0;
+        const r = root.getBoundingClientRect();
+        note.setText(`build ${BUILD} · lift ${this.kb || 0} · keyboard ${shell} · visible ${Math.round(vv.height)} at ${Math.round(vv.offsetTop)} · screen ${window.innerHeight} · view ends ${Math.round(r.bottom)} · ${root.closest(".workspace-drawer") ? "drawer" : "main"}`);
+      };
+      this.kbNote();
     }
     if (window.ResizeObserver) {
       const ro = new ResizeObserver(fit);
@@ -543,12 +650,31 @@ class VaultClaudeView extends ItemView {
       const f = leaf.view && leaf.view.file;
       if (f && f.path && !files.some((x) => x.path === f.path)) files.push(f);
     });
-    return files.filter((f) => !isPrivate(f.path));
+    // On Claude the money folder is open like the rest. On any other provider a money note is never offered.
+    return this.plugin.settings.provider === "claude" ? files : files.filter((f) => !isPrivate(f.path));
   }
 
   includedNotes() {
     if (!this.plugin.settings.sendContext) return [];
     return this.openNotes().filter((f) => !this.excluded.has(f.path));
+  }
+
+  // "Ask Quartzi" on selected text: the chat holds on to that text and the note it came from until the
+  // next message is sent, because once the chat box has focus the note is no longer the active view.
+  askAbout(file, text) {
+    const s = this.plugin.settings;
+    if (s.provider !== "claude" && isPrivate(file.path)) { this.toast("That note stays out of chats on this provider."); return; }
+    this.asked = { path: file.path, name: file.basename, text: String(text).slice(0, 8000) };
+    this.updateContext();
+    this.inputEl.focus();
+    this.updateSendButton();
+  }
+
+  askedContext() {
+    const a = this.asked;
+    if (!a) return {};
+    if (this.plugin.settings.provider !== "claude" && isPrivate(a.path)) return {};
+    return { activeFile: a.path, selection: a.text };
   }
 
   currentContext() {
@@ -571,6 +697,17 @@ class VaultClaudeView extends ItemView {
   updateContext() {
     if (!this.contextEl) return;
     this.contextEl.empty();
+    if (this.asked) {
+      // The selected text goes with the next message, whatever else is open.
+      const chip = this.contextEl.createEl("button", { cls: "vc-chip vc-chip-asked", attr: { "aria-label": "Selected text goes with your next message. Tap to leave it out." } });
+      icon(chip, "doc", "vc-ico-sm");
+      const words = this.asked.text.replace(/\s+/g, " ").trim();
+      chip.createSpan({ cls: "vc-chip-name", text: `“${words.length > 40 ? words.slice(0, 40) + "…" : words}”` });
+      chip.createSpan({ cls: "vc-chip-note", text: this.asked.name });
+      icon(chip, "xmark", "vc-ico-sm vc-chip-chev");
+      chip.onclick = (e) => { e.stopPropagation(); this.asked = null; this.updateContext(); };
+      return;
+    }
     const notes = this.openNotes();
     const open = new Set(notes.map((f) => f.path));
     for (const p of this.excluded) if (!open.has(p)) this.excluded.delete(p);
@@ -781,7 +918,9 @@ class VaultClaudeView extends ItemView {
       this.connectionAlert();
       return;
     }
-    const ctx = this.plugin.settings.sendContext ? this.currentContext() : {};
+    // Text sent with "Ask Quartzi" goes along even when open notes are left out: it was asked for.
+    const ctx = Object.assign(this.plugin.settings.sendContext ? this.currentContext() : {}, this.askedContext());
+    if (this.asked) { this.asked = null; this.updateContext(); }
     const reply = this.replyTo || null;
     this.setReply(null);
     this.inputEl.value = "";
@@ -1335,15 +1474,47 @@ class VaultClaudeView extends ItemView {
     row("reply", "Reply", () => this.setReply({ who: item.kind === "user" ? "you" : "claude", text: excerpt(selected || item.text || (item.files || []).map((f) => f.name).join(", ")) }));
     const copyText = selected || item.text || "";
     if (copyText) row("copy", selected ? "Copy Selection" : "Copy", async () => {
-      try { await navigator.clipboard.writeText(copyText); this.toast("Copied"); }
-      catch (e) { this.toast("Couldn't copy"); }
+      this.toast((await this.copyText(copyText)) ? "Copied" : "Couldn't copy");
     });
+    // A long press belongs to this menu, so picking out part of a message happens on a sheet of its own.
+    if (item.text) row("doc", "Select Text", () => this.openSelectText(item));
     const box = this.root.getBoundingClientRect();
     menu.style.transformOrigin = "top left";
     const w = 220;
     menu.style.left = `${Math.max(8, Math.min(x - box.left, box.width - w - 8))}px`;
     menu.style.top = `${Math.max(8, Math.min(y - box.top, box.height - 150))}px`;
     this.menuEl = menu;
+  }
+
+  // Copy that works on every device: the clipboard call first, and if the device refuses it, the older way.
+  async copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try { await navigator.clipboard.writeText(text); return true; } catch (e) { /* refused, try the older way */ }
+    }
+    const back = document.activeElement;
+    const src = document.body.createEl("textarea", { cls: "vc-copy-src" });
+    src.value = text;
+    src.setAttribute("readonly", "");
+    src.select();
+    src.setSelectionRange(0, text.length);
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    src.remove();
+    if (back && back.focus) back.focus();
+    return ok;
+  }
+
+  // The message as plain text on a sheet, where the device's own press-and-drag selection and Copy work.
+  openSelectText(item) {
+    const scrim = this.root.createDiv("vc-scrim vc-scrim-sheet");
+    const sheet = scrim.createDiv("vc-sheet");
+    const close = () => { sheet.addClass("is-out"); scrim.addClass("is-out"); window.setTimeout(() => scrim.remove(), 300); };
+    scrim.onclick = (e) => { if (e.target === scrim) close(); };
+    const bar = sheet.createDiv("vc-sheet-bar vc-material");
+    bar.createEl("button", { cls: "vc-plain", text: "Copy All" }).onclick = async () => { this.toast((await this.copyText(item.text)) ? "Copied" : "Couldn't copy"); };
+    bar.createDiv({ cls: "vc-sheet-title", text: "Select Text" });
+    bar.createEl("button", { cls: "vc-plain is-bold", text: "Done" }).onclick = close;
+    sheet.createDiv({ cls: "vc-sheet-body vc-select-text", text: item.text });
   }
 
   setReply(reply) {
@@ -1416,7 +1587,7 @@ class VaultClaudeView extends ItemView {
     icon(sum, "chevronRight", "vc-ico-xs vc-tool-chev");
     const body = el.createDiv("vc-tool-body");
     body.createEl("pre", { text: JSON.stringify(item.input, null, 2).slice(0, 3000) });
-    if (item.result !== undefined) body.createEl("pre", { text: item.result || "(no output)" });
+    if (item.result !== undefined) body.createEl("pre", { text: item.result || (item.trimmed ? "(output not kept in saved chats)" : "(no output)") });
     el.open = wasOpen;
   }
 
@@ -1431,7 +1602,12 @@ class VaultClaudeView extends ItemView {
   renderMarkdown(el, text, streaming) {
     el.toggleClass("is-streaming", !!streaming);
     el.empty();
-    MarkdownRenderer.render(this.app, text, el, "", this);
+    MarkdownRenderer.render(this.app, safeMarkdown(text), el, "", this);
+    // A second guard: anything that still tries to load from outside the vault is removed before it can.
+    el.querySelectorAll("img, iframe, video, audio, source, embed, object").forEach((m) => {
+      const src = m.getAttribute("src") || m.getAttribute("data") || "";
+      if (/^(https?:)?\/\//i.test(src.trim())) m.remove();
+    });
     el.querySelectorAll("a.internal-link").forEach((a) => {
       a.onclick = (e) => { e.preventDefault(); this.app.workspace.openLinkText(a.getAttr("data-href") || a.getText(), "", false); };
     });
@@ -1849,7 +2025,9 @@ function findClaude(configured) {
   const home = os.homedir();
   const win = process.platform === "win32";
   const candidates = win
-    ? [path.join(home, ".local", "bin", "claude.exe"), path.join(process.env.LOCALAPPDATA || "", "Programs", "claude", "claude.exe")]
+    ? [path.join(home, ".local", "bin", "claude.exe"), path.join(process.env.LOCALAPPDATA || "", "Programs", "claude", "claude.exe"),
+       // Installed with npm: the real program sits inside the package, behind a .cmd launcher.
+       path.join(process.env.APPDATA || path.join(home, "AppData", "Roaming"), "npm", "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe")]
     : [path.join(home, ".local", "bin", "claude"), "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "/usr/bin/claude", path.join(home, ".claude", "local", "claude")];
   for (const c of candidates) if (c && fs.existsSync(c)) return c;
   // Last resort: whatever PATH (or the login shell) resolves.
@@ -1858,7 +2036,18 @@ function findClaude(configured) {
     const out = win
       ? cp.execFileSync("where.exe", ["claude"], { encoding: "utf8", windowsHide: true })
       : cp.execFileSync(process.env.SHELL || "/bin/zsh", ["-lic", "command -v claude"], { encoding: "utf8", timeout: 4000 });
-    const hit = out.split(/\r?\n/).map((l) => l.trim()).find((l) => l && fs.existsSync(l) && !/\.cmd$/i.test(l));
+    const lines = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    if (win) {
+      // An npm launcher (claude, claude.cmd) can't be started directly. Use the program it points at.
+      for (const l of lines) {
+        const real = path.join(path.dirname(l), "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe");
+        if (fs.existsSync(real)) return real;
+      }
+      const exe = lines.find((l) => /\.exe$/i.test(l) && fs.existsSync(l));
+      if (exe) return exe;
+      return null;
+    }
+    const hit = lines.find((l) => fs.existsSync(l));
     if (hit) return hit;
   } catch (e) { /* not found */ }
   return null;
@@ -1880,6 +2069,21 @@ function findPython() {
   return null;
 }
 
+// The host's working folder in the system temp folder. On a shared computer another user could make
+// it first, or leave a link there, and swap the speech script before it runs. So it must be a plain
+// folder that belongs to this user, and only this user may open it.
+function privateDir(p) {
+  const fs = nodeRequire("fs");
+  fs.mkdirSync(p, { recursive: true, mode: 0o700 });
+  const st = fs.lstatSync(p);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`${p} is not a plain folder. Remove it and restart Obsidian.`);
+  if (process.platform !== "win32") {
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) throw new Error(`${p} belongs to another user. Remove it and restart Obsidian.`);
+    fs.chmodSync(p, 0o700);
+  }
+  return p;
+}
+
 function sameToken(a, b) {
   const crypto = nodeRequire("crypto");
   const x = Buffer.from(String(a || ""));
@@ -1893,6 +2097,10 @@ class WsConn {
     this.socket = socket;
     this.buf = Buffer.alloc(0);
     this.parts = [];
+    this.partsLen = 0;
+    // Before pairing a device may send only small messages, so an unpaired peer can't fill memory.
+    // Paired, a message may carry attachments (up to 20 MB each, sent as text).
+    this.maxMessage = 64 * 1024;
     this.open = true;
     this.onmessage = null;
     this.onclose = null;
@@ -1903,6 +2111,9 @@ class WsConn {
   }
 
   feed(chunk) {
+    // Whole frames are handled as soon as they arrive, so at most one part-frame waits here, and its
+    // size was checked against maxMessage as soon as its header came in.
+    if (!this.open) return;
     this.buf = Buffer.concat([this.buf, chunk]);
     for (;;) {
       if (this.buf.length < 2) return;
@@ -1912,6 +2123,7 @@ class WsConn {
       let off = 2;
       if (len === 126) { if (this.buf.length < 4) return; len = this.buf.readUInt16BE(2); off = 4; }
       else if (len === 127) { if (this.buf.length < 10) return; len = Number(this.buf.readBigUInt64BE(2)); off = 10; }
+      if (len > this.maxMessage || this.partsLen + len > this.maxMessage) { this.buf = Buffer.alloc(0); this.close(); return; }
       const masked = b1 & 0x80;
       const need = off + (masked ? 4 : 0) + len;
       if (this.buf.length < need) return;
@@ -1927,9 +2139,11 @@ class WsConn {
       if (opcode === 0x9) { this.frame(0xa, payload); continue; }
       if (opcode === 0xa) continue;
       this.parts.push(payload);
+      this.partsLen += payload.length;
       if (b0 & 0x80) {
         const text = Buffer.concat(this.parts).toString("utf8");
         this.parts = [];
+        this.partsLen = 0;
         if (this.onmessage) this.onmessage(text);
       }
     }
@@ -1979,8 +2193,9 @@ class Host {
     const fs = nodeRequire("fs");
     this.claude = findClaude(this.config.claudePath);
     if (!this.claude) throw new Error("Claude Code wasn't found on this computer. Install it from claude.com/claude-code, or set its path in settings.");
-    this.tmp = path.join(os.tmpdir(), "vault-claude");
-    fs.mkdirSync(this.tmp, { recursive: true });
+    this.tmp = privateDir(path.join(os.tmpdir(), "vault-claude"));
+    privateDir(this.attachRoot(false));
+    privateDir(this.attachRoot(true));
     this.sweepAttachments();
 
     const hosts = [];
@@ -2079,6 +2294,13 @@ class Host {
     this.addresses = [];
   }
 
+  // A new pairing code takes effect at once: every device paired with the old one is let go,
+  // and has to connect again with the new code.
+  setToken(code) {
+    this.config.token = code;
+    for (const c of this.conns || []) if (c.authed) c.close();
+  }
+
   // The address other devices should use: Tailscale if hosting there, else the first bound one.
   publicUrl() {
     const ts = this.addresses.find((a) => a.startsWith("100."));
@@ -2106,9 +2328,10 @@ class Host {
       let msg;
       try { msg = JSON.parse(text); } catch (e) { return; }
       if (!authed) {
-        if (msg.type === "auth" && sameToken(msg.token, this.config.token)) {
+        if (msg.type === "auth" && String(this.config.token || "").length >= MIN_CODE_LENGTH && sameToken(msg.token, this.config.token)) {
           authed = true;
           ws.authed = true;
+          ws.maxMessage = 128 * 1048576;
           clearTimeout(authTimer);
           ws.send(Object.assign({ type: "hello", vault: nodeRequire("path").basename(this.config.vaultPath), vaultRoot: this.config.vaultPath, host: nodeRequire("os").hostname() }, this.statusMessage()));
           this.log(`Paired device connected: ${peer}${msg.version ? " (plugin " + msg.version + ")" : ""}`);
@@ -2159,9 +2382,11 @@ class Host {
   buildPrompt(msg, saved) {
     const ctx = msg.context || {};
     const lines = [];
+    // Money notes are held back only from a chat that leaves this computer for another provider.
     // Checked here too, because a device on an older version still sends these.
-    const hidden = this.privateNote(ctx.activeFile);
-    const others = (ctx.openFiles || []).filter((p) => !this.privateNote(p));
+    const outside = this.offComputer(this.providerDef(msg.provider) ? msg.provider : "claude");
+    const hidden = outside && this.privateNote(ctx.activeFile);
+    const others = (ctx.openFiles || []).filter((p) => !(outside && this.privateNote(p)));
     if (ctx.activeFile && !hidden) lines.push(`The note the user is looking at: ${ctx.activeFile}`);
     if (others.length) lines.push("Other notes they have open in tabs or windows and chose to share (read or edit them as the request needs): " + others.slice(0, 20).join(", "));
     if (ctx.selection && ctx.activeFile && !hidden && this.noteExists(ctx.activeFile)) lines.push("They have this text selected in it:\n<selection>\n" + String(ctx.selection).slice(0, 8000) + "\n</selection>");
@@ -2386,7 +2611,8 @@ class Host {
 
   systemPrompt(noShell) {
     const log = this.config.logPath;
-    const base = [SYSTEM_PROMPT, PRIVATE_PROMPT, noShell ? NO_SHELL_PROMPT : ""].filter(Boolean).join("\n");
+    // noShell is true exactly for a chat that leaves this computer for another provider: only that one is told to stay out of the money folder.
+    const base = [SYSTEM_PROMPT, noShell ? PRIVATE_PROMPT : "", noShell ? NO_SHELL_PROMPT : ""].filter(Boolean).join("\n");
     return log ? `${base}\nWhen the user asks you to log a build or a publish, add one plain bullet (never a checkbox) with the date to the note ${log}.` : base;
   }
 
@@ -2403,7 +2629,10 @@ class Host {
     // Git instructions would put file names and commit messages from the vault's repo in the first request.
     const settings = outside
       ? { permissions: { deny: PRIVATE_DENY.concat(outsideDeny(this.config.configDir, this.tmp, this.outsideConfig())) }, disableAllHooks: true, includeGitInstructions: false }
-      : { permissions: { deny: PRIVATE_DENY } };
+      // On Claude or a local model the whole vault is open, the money folder included, except Obsidian's own
+      // settings and plugins: a note with hidden instructions must not get a chat to rewrite plugin code,
+      // which would run the next time Obsidian starts.
+      : { permissions: { deny: configDeny(this.config.configDir) } };
     const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
       "--include-partial-messages", "--append-system-prompt", this.systemPrompt(outside), "--add-dir", attachDir,
       "--permission-mode", mode, "--model", model, "--settings", JSON.stringify(settings)];
@@ -2559,8 +2788,9 @@ class Host {
     const cp = nodeRequire("child_process");
     if (this.python === undefined) this.python = findPython();
     if (!this.python) return null;
+    if (this.stopped || !this.tmp) return null; // the host was stopped while this waited to start
     const script = path.join(this.tmp, "transcribe.py");
-    fs.writeFileSync(script, TRANSCRIBE_PY);
+    fs.writeFileSync(script, TRANSCRIBE_PY, { mode: 0o600 });
     const proc = cp.spawn(this.python[0], [...this.python[1], script, "base.en"], {
       windowsHide: true, env: Object.assign({}, process.env, { PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" }),
     });
@@ -2626,6 +2856,7 @@ class Host {
   }
 }
 
+const BUILD = "11-12 c";
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 function newPairingCode() {
   const bytes = new Uint8Array(16);
@@ -2669,13 +2900,11 @@ class VaultClaudeSettings extends PluginSettingTab {
 
         const code = new Setting(containerEl)
           .setName("Pairing code")
-          .setDesc("Enter this on your other devices. If your vault syncs (iCloud, Obsidian Sync), they get it automatically.");
+          .setDesc("Type this, and the address below, into Quartzi Copilot settings on each of your other devices, once. It stays on each device and never syncs. New code lets every paired device go until it has the new one.");
         code.controlEl.createEl("code", { cls: "vc-code", text: s.pairingCode || "—" });
         code.addButton((b) => b.setButtonText("Copy").onClick(() => { navigator.clipboard.writeText(s.pairingCode); new Notice("Pairing code copied"); }));
         code.addButton((b) => b.setButtonText("New code").setWarning().onClick(async () => {
-          s.pairingCode = newPairingCode();
-          if (plugin.host) plugin.host.config.token = s.pairingCode;
-          await plugin.saveSettings();
+          await plugin.newCode();
           this.display();
         }));
 
@@ -2683,10 +2912,9 @@ class VaultClaudeSettings extends PluginSettingTab {
           const url = plugin.host.publicUrl();
           const addr = new Setting(containerEl)
             .setName("Address for your other devices")
-            .setDesc(s.serverUrl === url ? "Your synced devices already use this address." : "Your other devices use a different address. Tap Use to point them here.");
+            .setDesc("Type this into Quartzi Copilot settings on each of your other devices.");
           addr.controlEl.createEl("code", { cls: "vc-code", text: url });
           addr.addButton((b) => b.setButtonText("Copy").onClick(() => { navigator.clipboard.writeText(url); new Notice("Address copied"); }));
-          if (s.serverUrl !== url) addr.addButton((b) => b.setButtonText("Use").setCta().onClick(async () => { s.serverUrl = url; await plugin.saveSettings(); this.display(); }));
         }
 
         let restartTimer = null;
@@ -2728,25 +2956,35 @@ class VaultClaudeSettings extends PluginSettingTab {
     }
     if (Platform.isDesktopApp && plugin.hostEnabled()) this.providerSettings(containerEl);
     else this.providerStatus(containerEl);
-    new Setting(containerEl).setName(Platform.isDesktopApp ? "Connect to another computer" : "Connect to your computer").setHeading();
-    if (Platform.isDesktopApp && plugin.hostEnabled()) {
-      containerEl.createDiv({ cls: "setting-item-description vc-settings-note", text: "This computer runs Claude Code itself, so it doesn't use these. They are what your other devices use." });
+    new Setting(containerEl)
+      .setName("Show keyboard numbers")
+      .setDesc("Shows the keyboard measurements above the message box on this device, for fixing layout. Build " + BUILD + ".")
+      .addToggle((t) => t.setValue(plugin.local("kbdebug") === "on").onChange((on) => { plugin.local("kbdebug", on ? "on" : "off"); plugin.views().forEach((v) => v.kbNote && v.kbNote()); }));
+    // A computer that runs Claude Code itself connects to itself, so these are only for other devices.
+    if (!(Platform.isDesktopApp && plugin.hostEnabled())) {
+      new Setting(containerEl).setName(Platform.isDesktopApp ? "Connect to another computer" : "Connect to your computer").setHeading();
+      containerEl.createDiv({ cls: "setting-item-description vc-settings-note", text: "Both are kept on this device only and never sync. Find them in Quartzi Copilot settings on the computer running Claude Code." });
+      new Setting(containerEl)
+        .setName("Computer address")
+        .setDesc("For example ws://100.101.102.103:8787.")
+        .addText((t) => t.setPlaceholder("ws://100.x.y.z:8787").setValue(s.serverUrl).onChange(async (v) => {
+          s.serverUrl = v.trim();
+          await plugin.saveSettings();
+        }));
+      new Setting(containerEl)
+        .setName("Pairing code")
+        .addText((t) => { t.inputEl.type = "password"; t.setPlaceholder("XXXX-XXXX-XXXX-XXXX").setValue(s.pairingCode).onChange(async (v) => {
+          s.pairingCode = v.trim().toUpperCase();
+          await plugin.saveSettings();
+        }); })
+        .addButton((b) => b.setButtonText("Reconnect").onClick(() => plugin.views().forEach((v) => v.reconnect())));
     }
+
+    new Setting(containerEl).setName("Saved chats").setHeading();
     new Setting(containerEl)
-      .setName("Computer address")
-      .setDesc("Shown in Quartzi Copilot settings on the computer running Claude Code, for example ws://100.101.102.103:8787.")
-      .addText((t) => t.setPlaceholder("ws://100.x.y.z:8787").setValue(s.serverUrl).onChange(async (v) => {
-        s.serverUrl = v.trim();
-        await plugin.saveSettings();
-      }));
-    new Setting(containerEl)
-      .setName("Pairing code")
-      .addText((t) => t.setPlaceholder("XXXX-XXXX-XXXX-XXXX").setValue(s.pairingCode).onChange(async (v) => {
-        s.pairingCode = v.trim().toUpperCase();
-        if (plugin.host) plugin.host.config.token = s.pairingCode;
-        await plugin.saveSettings();
-      }))
-      .addButton((b) => b.setButtonText("Reconnect").onClick(() => plugin.views().forEach((v) => v.reconnect())));
+      .setName("Keep tool output")
+      .setDesc("Saved chats sync to your other devices. Off, they keep what each tool was asked to do but not what it returned, such as the text of notes it read. Kept on this device only.")
+      .addToggle((t) => t.setValue(!!s.keepToolOutput).onChange(async (on) => { s.keepToolOutput = on; await plugin.saveSettings(); }));
 
     new Setting(containerEl).setName("Connection").setHeading();
     new Setting(containerEl)
@@ -2833,7 +3071,9 @@ class VaultClaudeSettings extends PluginSettingTab {
 
 module.exports = class VaultClaudePlugin extends Plugin {
   async onload() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const data = (await this.loadData()) || {};
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+    this.loadLocalSettings(data);
     // Older versions saved "" for Default/Auto; those choices are gone.
     if (!this.settings.provider) this.settings.provider = "claude";
     if (!MODELS.some(([v]) => v === this.settings.model)) this.settings.model = DEFAULT_SETTINGS.model;
@@ -2847,11 +3087,19 @@ module.exports = class VaultClaudePlugin extends Plugin {
     this.addCommand({
       id: "ask-about-selection",
       name: "Ask about selection",
-      editorCallback: async (editor) => {
-        const view = await this.activate();
-        if (view && editor.getSelection()) { view.inputEl.value = "About the selected text: "; view.inputEl.focus(); }
+      editorCheckCallback: (checking, editor, info) => {
+        if (!editor.getSelection().trim() || !info || !info.file) return false;
+        if (!checking) this.askQuartzi(info.file, editor.getSelection());
+        return true;
       },
     });
+    // Right-click on selected text in a note: "Ask Quartzi" opens the chat with that text attached.
+    this.registerEvent(this.app.workspace.on("editor-menu", (menu, editor, info) => {
+      const text = editor.getSelection();
+      const file = info && info.file;
+      if (!text.trim() || !file) return;
+      menu.addItem((item) => item.setTitle("Ask Quartzi").setIcon("quartzi").onClick(() => this.askQuartzi(file, text)));
+    }));
     this.addCommand({
       id: "add-to-build-log",
       name: "Add to build log",
@@ -2888,6 +3136,42 @@ module.exports = class VaultClaudePlugin extends Plugin {
     const scoped = k + ":" + this.app.vault.getName();
     if (value === undefined) return window.localStorage.getItem(scoped);
     window.localStorage.setItem(scoped, value);
+  }
+
+  // ---------- settings kept on this device ----------
+  // The values in LOCAL_SETTINGS live in this device's own storage, never in data.json. Builds before
+  // 11-12 b kept them in data.json. On the first start of this build each device takes over what it
+  // had there, except the pairing code: that one has been in a synced file, so the host makes a new
+  // one and every other device is given it by hand. Then they are taken out of data.json.
+  loadLocalSettings(data) {
+    let inData = false;
+    for (const k of LOCAL_SETTINGS) {
+      if (data[k] !== undefined) inData = true;
+      const kept = this.localSetting(k);
+      if (kept !== undefined) this.settings[k] = kept;
+      else if (k === "pairingCode") this.settings[k] = "";
+      else if (data[k] !== undefined) this.localSetting(k, data[k]);
+      else this.settings[k] = DEFAULT_SETTINGS[k];
+    }
+    // Take them out of data.json now, so a sync copy made before this build stops carrying them.
+    if (inData) this.saveSettings();
+  }
+
+  localSetting(key, value) {
+    if (value === undefined) {
+      const raw = this.local("set-" + key);
+      if (raw === null || raw === undefined || raw === "") return undefined;
+      try { return JSON.parse(raw); } catch (e) { return undefined; }
+    }
+    this.local("set-" + key, JSON.stringify(value));
+  }
+
+  // A new code for this host. Every device paired with the old one is let go.
+  async newCode() {
+    this.settings.pairingCode = newPairingCode();
+    await this.saveSettings();
+    if (this.host) this.host.setToken(this.settings.pairingCode);
+    this.views().forEach((v) => v.reconnect());
   }
 
   // What this device last heard from the host, for naming it when it can't be reached.
@@ -2979,7 +3263,7 @@ module.exports = class VaultClaudePlugin extends Plugin {
   async startHost() {
     this.stopHost();
     const s = this.settings;
-    if (!s.pairingCode) { s.pairingCode = newPairingCode(); await this.saveSettings(); }
+    if (String(s.pairingCode || "").replace(/-/g, "").length < MIN_CODE_LENGTH) { s.pairingCode = newPairingCode(); await this.saveSettings(); }
     this.migrateKeys();
     const adapter = this.app.vault.adapter;
     const port = Number(s.hostPort) || 8787;
@@ -3018,17 +3302,10 @@ module.exports = class VaultClaudePlugin extends Plugin {
     this.host = null;
   }
 
-  // Another device saved data.json (iCloud, Obsidian Sync). Pick up a new address or pairing
-  // code without a restart; chats on this device are left as they are.
-  async onExternalSettingsChange() {
-    const data = (await this.loadData()) || {};
-    let changed = false;
-    for (const key of ["serverUrl", "pairingCode"]) {
-      if (this.hosting() && key === "pairingCode") continue; // the host owns its code
-      if (data[key] && data[key] !== this.settings[key]) { this.settings[key] = data[key]; changed = true; }
-    }
-    if (changed) this.views().forEach((v) => v.reconnect());
-  }
+  // Another device saved data.json (iCloud, Obsidian Sync). The address and pairing code are no longer
+  // taken from it: each device keeps its own, so an edit to a synced file can't point this device at
+  // another computer or change what the host accepts. Chats on this device are left as they are.
+  async onExternalSettingsChange() {}
 
   views() {
     return this.app.workspace.getLeavesOfType(VIEW_TYPE).map((l) => l.view);
@@ -3043,11 +3320,25 @@ module.exports = class VaultClaudePlugin extends Plugin {
       leaf = beside ? ws.getLeaf("split", "vertical") : ws.getRightLeaf(false);
       await leaf.setViewState({ type: VIEW_TYPE, active: true });
     }
-    this.app.workspace.revealLeaf(leaf);
+    await this.app.workspace.revealLeaf(leaf);
+    if (typeof leaf.loadIfDeferred === "function") await leaf.loadIfDeferred();
     return leaf.view;
   }
 
+  async askQuartzi(file, text) {
+    const view = await this.activate();
+    if (view && typeof view.askAbout === "function") view.askAbout(file, text);
+  }
+
+  // data.json gets everything but the settings kept on this device. Unless this device keeps tool
+  // output, saved chats keep only what each tool was asked to do.
   async saveSettings() {
-    await this.saveData(this.settings);
+    const out = Object.assign({}, this.settings);
+    for (const k of LOCAL_SETTINGS) { this.localSetting(k, this.settings[k]); delete out[k]; }
+    if (!this.settings.keepToolOutput) out.sessions = (this.settings.sessions || []).map(trimSession);
+    await this.saveData(out);
   }
 };
+
+// For checks outside Obsidian only; Obsidian ignores this.
+module.exports.securityCore = { VaultClaudeView, safeMarkdown, trimSession, trimToolItem, configDeny, privateDir, WsConn, Host, LOCAL_SETTINGS, MIN_CODE_LENGTH, newPairingCode };

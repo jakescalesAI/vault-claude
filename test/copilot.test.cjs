@@ -47,7 +47,7 @@ function stubProvider() {
   return new Promise((r) => s.server.listen(0, "127.0.0.1", () => { s.base = `http://127.0.0.1:${s.server.address().port}/v1`; r(s); }));
 }
 
-function client(port, token = "T") {
+function client(port, token = "TEST-TEST-TEST-TEST") {
   return new Promise((resolve) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}`);
     const msgs = [];
@@ -99,7 +99,7 @@ const resultOf = (msgs) => { const r = msgs.find((m) => m.type === "event" && m.
   process.env.MY_SERVER_KEY = FAKE_KEY;
   const PORT = 18790;
   const logs = [];
-  const host = new T.Host({ vaultPath: tmp, port: PORT, bind: "local", token: "T", claudePath: fake, transcribeCommand: "x", getCustom: () => customs, version: "0.9.0", logPath: "Build log.md" }, (m) => logs.push(m));
+  const host = new T.Host({ vaultPath: tmp, port: PORT, bind: "local", token: "TEST-TEST-TEST-TEST", claudePath: fake, transcribeCommand: "x", getCustom: () => customs, version: "0.9.0", logPath: "Build log.md" }, (m) => logs.push(m));
   await host.start();
 
   // ---------- providers and keys ----------
